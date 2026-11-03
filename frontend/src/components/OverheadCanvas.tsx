@@ -18,7 +18,7 @@ const LABEL_COLORS: Record<string, string> = {
   gripper: "#4aa3ff",
   hand: "#ffb020",
   obstacle: "#c58cff",
-  bin: "#8aa0b8",
+  goal: "#28d0c8",
 };
 const HIJACK_COLOR = "#ff4d4d";
 const DISTRACTOR_COLOR = "#ffd166";

@@ -348,10 +348,18 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=None)
     parser.add_argument("--webcam", default=None, metavar="INDEX",
                         help="camera-only mode: use this USB webcam (index or /dev/videoN) as the overhead view, no arm")
+    parser.add_argument("--camera", default=None, metavar="INDEX_OR_PATH",
+                        help="real arm: overhead camera, an index or a path such as /dev/video2")
+    parser.add_argument("--camera-size", default=None, metavar="WxH",
+                        help="real arm: overhead capture size, e.g. 640x360 (must be a size the camera supports and the policy was trained at)")
+    parser.add_argument("--wrist-camera", default=None, metavar="INDEX_OR_PATH|none",
+                        help="real arm: wrist camera, or 'none' if the policy has no wrist image")
     parser.add_argument("--concepts", default=None,
                         help='comma-separated SAM 3.1 noun phrases, optionally role=phrase '
-                             '(roles: target, gripper, obstacle, hand), e.g. "target=red cube,gripper=robot arm,coffee mug"')
+                             '(roles: target, gripper, obstacle, goal, hand), e.g. "target=red cube,gripper=robot arm,coffee mug"')
     parser.add_argument("--task", default=None, help="task / scene description given to Muse Spark")
+    parser.add_argument("--disable-triggers", default=None, metavar="LIST",
+                        help="comma-separated anomaly triggers to turn off: servo,variance,hijack,stall (the arm keeps running)")
     parser.add_argument("--no-auto-analyze", action="store_true", help="detect anomalies but wait for the button")
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args()
@@ -367,6 +375,22 @@ def main() -> None:
         "port": args.port,
         "auto_analyze": False if args.no_auto_analyze else None,
     }
+    camera = lambda v: int(v) if v.isdigit() else v  # noqa: E731
+    if args.camera:
+        overrides["overhead_camera_index"] = camera(args.camera)
+    if args.camera_size:
+        try:
+            width, height = (int(v) for v in args.camera_size.lower().split("x"))
+        except ValueError:
+            parser.error("--camera-size must look like 640x360")
+        overrides["overhead_width"], overrides["overhead_height"] = width, height
+    if args.wrist_camera:
+        if args.wrist_camera.lower() == "none":
+            overrides["wrist_camera_key"] = ""
+        else:
+            overrides["wrist_camera_index"] = camera(args.wrist_camera)
+    if args.disable_triggers:
+        overrides["disabled_triggers"] = [t.strip() for t in args.disable_triggers.split(",") if t.strip()]
     if args.webcam is not None:
         overrides["camera_only"] = True
         overrides["overhead_camera_index"] = int(args.webcam) if args.webcam.isdigit() else args.webcam

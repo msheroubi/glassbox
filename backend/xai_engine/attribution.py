@@ -14,9 +14,10 @@ import cv2
 import numpy as np
 
 from backend.robot.calibration import Homography
+from backend.xai_engine.attention_reference import grid_share
 from backend.schemas import AnomalyEvent, MaskAttribution, SegmentedObjectView, ServoTelemetry
 
-NON_DISTRACTOR_LABELS = {"target", "gripper"}
+NON_DISTRACTOR_LABELS = {"target", "gripper", "goal"}
 
 
 @dataclass
@@ -82,8 +83,9 @@ def saliency_centroid(saliency: np.ndarray, mask: np.ndarray | None = None) -> t
 
 
 def compute_attributions(
-    objects: list[SegmentedObject], saliency: np.ndarray | None, homography: Homography
+    objects: list[SegmentedObject], saliency: np.ndarray | None, homography: Homography, deviation=None
 ) -> list[MaskAttribution]:
+    """``deviation`` (attention_reference.Deviation) adds each mask's expected share and share of unexpected attention."""
     gripper = next((o.mask for o in objects if o.label == "gripper"), None)
     out = []
     for obj in objects:
@@ -97,6 +99,8 @@ def compute_attributions(
                 workspace_xy_mm=[round(x, 1), round(y, 1)],
                 attention_share=round(attention_share(saliency, obj.mask), 4) if saliency is not None else 0.0,
                 iou_with_gripper=round(iou(obj.mask, gripper), 4) if gripper is not None and obj.label != "gripper" else 0.0,
+                expected_share=round(grid_share(deviation.expected, obj.mask), 4) if deviation is not None else None,
+                excess_share=round(grid_share(deviation.excess, obj.mask), 4) if deviation is not None else None,
             )
         )
     return out
@@ -106,6 +110,9 @@ def joint_error(qpos_target, qpos_actual) -> float:
     """Servo following error ||q_target - q_actual||_2 over the five body joints (degrees)."""
     d = np.asarray(qpos_target[:5], dtype=np.float64) - np.asarray(qpos_actual[:5], dtype=np.float64)
     return float(np.linalg.norm(d))
+
+
+STALL_SPEED_DEG_S = 15.0  # a servo is "stalled" only if the body joints are (nearly) not moving
 
 
 class AnomalyDetector:
@@ -119,7 +126,11 @@ class AnomalyDetector:
         variance_threshold: float,
         hijack_threshold: float,
         stall_window_s: float,
+        disabled: frozenset[str] = frozenset(),
+        deviation_threshold: float | None = None,
+        deviation_hold_s: float = 1.0,
     ) -> None:
+        self.disabled = disabled  # any of: servo, variance, hijack, stall, deviation
         self.hz = hz
         self.je_thr = joint_error_threshold
         self.je_hold = max(1, int(joint_error_hold_s * hz))
@@ -128,18 +139,23 @@ class AnomalyDetector:
         self.hijack_thr = hijack_threshold
         self.hijack_hold = max(1, int(0.5 * hz))
         self.stall_window = max(2, int(stall_window_s * hz))
+        # With an attention reference, "attention left what the demos did" replaces the fixed A(i) rule.
+        self.dev_thr = deviation_threshold
+        self.dev_hold = max(1, int(deviation_hold_s * hz))
         self.reset()
 
     def reset(self) -> None:
-        self.je_count = self.var_count = self.hijack_count = 0
+        self.je_count = self.var_count = self.hijack_count = self.dev_count = 0
         self.qpos_hist: deque[np.ndarray] = deque(maxlen=self.stall_window)
         self.armed = True
 
     def update(
         self, tel: ServoTelemetry, attributions: list[MaskAttribution] | None = None
     ) -> AnomalyEvent | None:
-        self.qpos_hist.append(np.asarray(tel.qpos_actual[:3]))
-        self.je_count = self.je_count + 1 if tel.joint_error > self.je_thr else 0
+        self.qpos_hist.append(np.asarray(tel.qpos_actual[:6]))  # incl. wrist and gripper: grasping is progress
+        speed = float(np.linalg.norm(np.asarray(tel.qvel[:5])))
+        # Tracking lag while the arm moves is normal; a collision shows as large error with no motion.
+        self.je_count = self.je_count + 1 if tel.joint_error > self.je_thr and speed < STALL_SPEED_DEG_S else 0
         self.var_count = self.var_count + 1 if tel.action_chunk_variance > self.var_thr else 0
         max_share, top = 0.0, None
         if attributions:
@@ -147,19 +163,28 @@ class AnomalyDetector:
             max_share = top.attention_share if top else 0.0
         self.hijack_count = self.hijack_count + 1 if max_share > self.hijack_thr else 0
 
+        self.dev_count = self.dev_count + 1 if self.dev_thr is not None and tel.attention_deviation > self.dev_thr else 0
+
         if not self.armed:
             return None
         reasons = []
-        if self.je_count >= self.je_hold:
-            reasons.append(f"servo following error {tel.joint_error:.1f} deg > {self.je_thr} deg (collision/stall)")
-        if self.var_count >= self.var_hold:
+        if self.dev_count >= self.dev_hold and "deviation" not in self.disabled:
+            culprit = max((a for a in attributions or [] if a.excess_share), key=lambda a: a.excess_share, default=None)
+            where = f"; {culprit.excess_share:.0%} of it is on '{culprit.label}' #{culprit.mask_id}" if culprit else ""
+            reasons.append(
+                f"attention deviates from the demos: {tel.attention_deviation:.0%} of it is somewhere the policy "
+                f"never looked at this arm pose (> {self.dev_thr:.0%}){where}"
+            )
+        if self.je_count >= self.je_hold and "servo" not in self.disabled:
+            reasons.append(f"servo following error {tel.joint_error:.1f} deg > {self.je_thr} deg while the arm is not moving (collision/stall)")
+        if self.var_count >= self.var_hold and "variance" not in self.disabled:
             reasons.append(f"action-chunk variance {tel.action_chunk_variance:.1f} > {self.var_thr} (OOD confusion)")
-        if self.hijack_count >= self.hijack_hold:
+        if self.hijack_count >= self.hijack_hold and "hijack" not in self.disabled:
             reasons.append(f"attention share on non-target '{top.label}' #{top.mask_id} A={max_share:.2f} > {self.hijack_thr}")
-        if len(self.qpos_hist) == self.stall_window:
+        if len(self.qpos_hist) == self.stall_window and "stall" not in self.disabled:
             spread = np.ptp(np.stack(self.qpos_hist), axis=0).max()
             if spread < 4.0:
-                reasons.append(f"no task progress for {self.stall_window / self.hz:.0f}s (arm joints moved {spread:.1f} deg)")
+                reasons.append(f"no task progress for {self.stall_window / self.hz:.0f}s (no joint (incl. gripper) moved more than {spread:.1f} deg)")
         if not reasons:
             return None
         self.armed = False
@@ -169,4 +194,5 @@ class AnomalyDetector:
             joint_error=round(tel.joint_error, 2),
             chunk_variance=round(tel.action_chunk_variance, 2),
             max_attention_share=round(max_share, 3),
+            attention_deviation=round(tel.attention_deviation, 3),
         )

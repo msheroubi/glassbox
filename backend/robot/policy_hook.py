@@ -50,17 +50,18 @@ def normalize_map(m: np.ndarray, size_wh: tuple[int, int]) -> np.ndarray:
 class ChunkVarianceTracker:
     """Variance across every predicted chunk that covers the current control step.
 
-    Requires ``n_action_steps < chunk_size`` so that consecutive chunks overlap.
+    Requires overlapping chunks: ``n_action_steps < chunk_size`` or observe-only passes between replans.
     """
 
     max_chunks: int = 8
+    horizon: int | None = None  # ignore predictions made more than this many steps ago (far-ahead guesses always disagree)
     chunks: deque = field(default_factory=lambda: deque(maxlen=8))
 
     def add(self, start_step: int, chunk: np.ndarray) -> None:
         self.chunks.append((start_step, chunk))
 
     def variance(self, step: int) -> float:
-        preds = [c[step - s] for s, c in self.chunks if 0 <= step - s < len(c)]
+        preds = [c[step - s] for s, c in self.chunks if 0 <= step - s < min(len(c), self.horizon or len(c))]
         if len(preds) < 2:
             return 0.0
         return float(np.var(np.stack(preds), axis=0)[:5].mean())  # body joints only
@@ -78,6 +79,7 @@ class ACTRunner:
         overhead_size_wh: tuple[int, int],
         n_action_steps: int,
         task: str,
+        observe_every: int = 0,
     ) -> None:
         import torch
         from lerobot.policies.act.modeling_act import ACTPolicy
@@ -112,10 +114,15 @@ class ACTRunner:
         model.backbone.register_forward_hook(lambda _m, _i, out: self._feature_maps.append(out["feature_map"].detach()))
         model.decoder.layers[-1].multihead_attn.register_forward_hook(self._capture_attn)
 
-        self.variance = ChunkVarianceTracker()
+        # Observe passes only make sense between replans.
+        self.observe_every = observe_every if 0 < observe_every < self.n_action_steps else 0
+        self.variance = ChunkVarianceTracker(horizon=2 * (self.observe_every or self.n_action_steps))
         self.queue: deque[np.ndarray] = deque()
         self.step_idx = 0
-        log.info("Loaded ACT policy from %s (chunk=%d, executing %d)", policy_path, self.chunk_size, self.n_action_steps)
+        log.info(
+            "Loaded ACT policy from %s (chunk=%d, executing %d, observing every %s)",
+            policy_path, self.chunk_size, self.n_action_steps, self.observe_every or "replan",
+        )
 
     def _capture_attn(self, _module, _inputs, output) -> None:
         weights = output[1] if isinstance(output, tuple) and len(output) > 1 else None
@@ -156,18 +163,24 @@ class ACTRunner:
         m = fmap.float().norm(dim=0).cpu().numpy()
         return normalize_map(m, self.overhead_size_wh), "resnet_layer4_activation"
 
+    def _predict(self, state: np.ndarray, images: dict[str, np.ndarray]) -> np.ndarray:
+        batch = self.preprocessor(self._observation(state, images))
+        with self.torch.inference_mode():
+            chunk = self.policy.predict_action_chunk(batch)  # (1, chunk_size, action_dim), normalised
+            chunk = self.postprocessor(chunk)
+        chunk = chunk[0].float().cpu().numpy()
+        self.variance.add(self.step_idx, chunk)
+        return chunk
+
     def step(self, state: np.ndarray, images: dict[str, np.ndarray]) -> PolicyStep:
         saliency, method, replanned = None, "", False
         if not self.queue:
-            batch = self.preprocessor(self._observation(state, images))
-            with self.torch.inference_mode():
-                chunk = self.policy.predict_action_chunk(batch)  # (1, chunk_size, action_dim), normalised
-                chunk = self.postprocessor(chunk)
-            chunk = chunk[0].float().cpu().numpy()
-            self.variance.add(self.step_idx, chunk)
-            self.queue.extend(chunk[: self.n_action_steps])
+            self.queue.extend(self._predict(state, images)[: self.n_action_steps])
             saliency, method = self._saliency()
             replanned = True
+        elif self.observe_every and self.step_idx % self.observe_every == 0:
+            self._predict(state, images)  # observe only: the executing chunk is left untouched
+            saliency, method = self._saliency()
         action = self.queue.popleft()
         var = self.variance.variance(self.step_idx)
         self.step_idx += 1
@@ -229,7 +242,7 @@ class MockPolicy:
         return np.array(steps)
 
     def step(self, state: np.ndarray, frame_bgr: np.ndarray, world) -> PolicyStep:
-        """``world`` exposes ``bin_xy_mm`` and ``holding`` (proprioceptive grasp signal)."""
+        """``world`` exposes ``goal_xy_mm`` and ``holding`` (proprioceptive grasp signal)."""
         sal = red_saliency(frame_bgr)
         gripper_xy = np.array(self.kin.fk(state))
         replanned = False
@@ -291,7 +304,7 @@ class MockPolicy:
                 self.phase, self.phase_t = "CARRY", 0
             return gripper_xy, []
         if self.phase == "CARRY":
-            goal = np.array(world.bin_xy_mm)
+            goal = np.array(world.goal_xy_mm)
             if np.linalg.norm(goal - gripper_xy) < 10.0:
                 self.phase, self.phase_t = "RELEASE", 0
             return goal, []

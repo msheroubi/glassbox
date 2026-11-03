@@ -23,6 +23,7 @@ class ServoTelemetry(BaseModel):
     torque_load: List[float] = Field(..., min_length=6, max_length=6)
     action_chunk_variance: float
     joint_error: float = 0.0
+    attention_deviation: float = 0.0  # fraction of the policy's attention outside what the demos attended at this pose
 
 
 class MaskAttribution(BaseModel):
@@ -34,6 +35,12 @@ class MaskAttribution(BaseModel):
         ..., description="0.0 to 1.0 fraction of policy saliency inside mask"
     )
     iou_with_gripper: float
+    expected_share: float | None = Field(
+        None, description="Share of attention inside this mask in the demos at the nearest arm poses"
+    )
+    excess_share: float | None = Field(
+        None, description="Fraction of the *unexpected* attention (vs the demos) that lies inside this mask"
+    )
 
 
 class XAIDiagnosisResponse(BaseModel):
@@ -71,6 +78,7 @@ class AnomalyEvent(BaseModel):
     joint_error: float
     chunk_variance: float
     max_attention_share: float = 0.0
+    attention_deviation: float = 0.0
 
 
 class SegmentedObjectView(BaseModel):

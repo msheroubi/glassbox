@@ -85,10 +85,12 @@ class Settings(BaseSettings):
     # --- Policy ---------------------------------------------------------------------------------
     policy_path: str | None = None  # local dir or HF repo id of a trained LeRobot ACT checkpoint
     policy_device: str = "cpu"
-    # Executing fewer steps than the chunk size gives overlapping chunks, which is what the
-    # action-chunk variance (OOD signal) is computed from.
-    policy_n_action_steps: int = 20
-    task_description: str = "Pick up the red cube and place it in the bin."
+    # Steps executed from each predicted chunk (the whole chunk, as in lerobot-record, runs most smoothly).
+    policy_n_action_steps: int = 100
+    # Re-run the policy every N steps without changing the executing chunk ("observe" passes): refreshes
+    # the attention map and gives the overlapping predictions the chunk-variance OOD signal needs. 0 = off.
+    policy_observe_every: int = 20
+    task_description: str = "Pick up the red cube and place it on the green hex tile."
 
     # --- Calibration ----------------------------------------------------------------------------
     homography_path: Path = REPO_ROOT / "calibration" / "homography.json"
@@ -102,8 +104,14 @@ class Settings(BaseSettings):
     joint_error_threshold_deg: float = 12.0
     joint_error_hold_s: float = 0.5
     chunk_variance_threshold: float = 25.0
-    attention_hijack_threshold: float = 0.45
+    attention_hijack_threshold: float = 0.45  # fixed A(i) rule: only used when there is no attention reference
+    # Attention-deviation trigger: attention compared with the demos' attention at the same arm pose
+    # (calibration/attention_reference.npz, built by scripts/build_attention_reference.py).
+    attention_reference_path: Path = REPO_ROOT / "calibration" / "attention_reference.npz"
+    attention_deviation_threshold: float | None = None  # None = the threshold calibrated into the reference file
+    attention_deviation_hold_s: float = 1.0  # sustained over two observe passes, so one noisy map can't stop the arm
     stall_progress_s: float = 4.0
+    disabled_triggers: list[str] = []  # servo | variance | hijack | stall: detection off, arm keeps running
     auto_analyze: bool = True
     use_sam_video: bool = False  # True: upload the 90-frame clip; False: segment the anomaly keyframe
     live_sam_interval_s: float = 4.0  # real robot: background SAM pass feeding the live hijack trigger (0 = off)
@@ -113,6 +121,7 @@ class Settings(BaseSettings):
         SegmentationConcept(label="target", prompt="red cube"),
         SegmentationConcept(label="distractor", prompt="red ball"),
         SegmentationConcept(label="obstacle", prompt="cardboard box"),
+        SegmentationConcept(label="goal", prompt="green hex tile"),
         SegmentationConcept(label="hand", prompt="human hand"),
     ]
 

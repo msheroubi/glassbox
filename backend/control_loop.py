@@ -40,6 +40,7 @@ from backend.robot.so101_interface import (
     SCENARIOS, MockSO101, Observation, PlanarKinematics, RealSO101, WebcamSource,
 )
 from backend.schemas import AnalysisResult, AnomalyEvent, AskResponse, RecoveryPlan, ServoTelemetry
+from backend.xai_engine.attention_reference import AttentionReference, Deviation
 from backend.xai_engine.attribution import (
     NON_DISTRACTOR_LABELS,
     AnomalyDetector,
@@ -146,9 +147,24 @@ class ControlLoop:
         self.suppressor = MaskSuppressor(self.plate, s.tabletop_bgr)
         self.executor = WaypointExecutor()
         self.grasp = GraspOffset()
+        self.reference: AttentionReference | None = None
+        self.attn_dev: Deviation | None = None
+        self.deviation_threshold: float | None = None
+        if s.policy_path and not self.mock and s.attention_reference_path.exists():
+            self.reference = AttentionReference.load(s.attention_reference_path)
+            self.deviation_threshold = s.attention_deviation_threshold or self.reference.threshold
+            if self.deviation_threshold is None:
+                log.warning("%s has no calibrated threshold: run scripts/calibrate_attention_reference.py", s.attention_reference_path)
+                self.reference = None
+            else:
+                log.info("Attention reference: %d demo samples, deviation threshold %.2f", len(self.reference.maps), self.deviation_threshold)
+        elif s.policy_path and not self.mock:
+            log.warning("No attention reference at %s: falling back to the fixed A(i) hijack rule", s.attention_reference_path)
+        disabled = frozenset(s.disabled_triggers) | ({"hijack"} if self.reference is not None else frozenset())
         self.detector = AnomalyDetector(
             s.control_hz, s.joint_error_threshold_deg, s.joint_error_hold_s, s.chunk_variance_threshold,
-            s.attention_hijack_threshold, s.stall_progress_s,
+            s.attention_hijack_threshold, s.stall_progress_s, disabled,
+            deviation_threshold=self.deviation_threshold, deviation_hold_s=s.attention_deviation_hold_s,
         )
         self.ring = RingBuffer(s.ring_buffer_frames)
         self.history: deque[ServoTelemetry] = deque(maxlen=int(10 * s.control_hz))
@@ -202,7 +218,7 @@ class ControlLoop:
         elif self.s.policy_path:
             self.policy = await asyncio.to_thread(
                 ACTRunner, self.s.policy_path, self.s.policy_device, self.s.overhead_camera_key, self.size_wh,
-                self.s.policy_n_action_steps, self.s.task_description,
+                self.s.policy_n_action_steps, self.s.task_description, self.s.policy_observe_every,
             )
             self.policy_kind = "act"
         elif self.mock:
@@ -291,6 +307,8 @@ class ControlLoop:
                     target, variance = np.asarray(step.action, np.float64), step.chunk_variance
                     if step.saliency is not None:
                         self.saliency, self.saliency_method = step.saliency, step.saliency_method
+                        if self.reference is not None:
+                            self.attn_dev = self.reference.score(obs.qpos, step.saliency)
                     self.phase = (
                         self.policy.phase if isinstance(self.policy, MockPolicy)
                         else "OBSERVE" if self.camera_only else "ACT"
@@ -308,6 +326,7 @@ class ControlLoop:
                 torque_load=_r(obs.load),
                 action_chunk_variance=round(float(variance), 3),
                 joint_error=round(joint_error(target, obs.qpos), 3) if self.state == RUNNING else 0.0,
+                attention_deviation=round(self.attn_dev.score, 4) if self.attn_dev is not None else 0.0,
             )
             self.history.append(tel)
 
@@ -320,7 +339,7 @@ class ControlLoop:
                 if event is not None:
                     self._on_anomaly(event)
             if self.mock and self.state == RUNNING and (self.robot.delivered or self.phase == "DONE"):
-                self.state, self.status_text = COMPLETE, "task complete: cube delivered to the bin"
+                self.state, self.status_text = COMPLETE, "task complete: cube delivered to the green hex tile"
                 self.robot.hold()
                 self.hub.publish_event({"type": "state", "state": self.state, "status": self.status_text})
             state, phase = self.state, self.phase
@@ -379,7 +398,7 @@ class ControlLoop:
         else:
             objs = self._sam_live_objects
         self.live_objects = objs
-        self.live_attrs = compute_attributions(objs, self.saliency, self.homography) if objs and self.saliency is not None else []
+        self.live_attrs = compute_attributions(objs, self.saliency, self.homography, self.attn_dev) if objs and self.saliency is not None else []
         shares = {a.mask_id: a.attention_share for a in self.live_attrs}
         self.live_views = [
             {**o.view().model_dump(), "source": o.source, "attention_share": shares.get(o.mask_id, 0.0)} for o in objs
@@ -399,7 +418,7 @@ class ControlLoop:
     def _on_anomaly(self, event: AnomalyEvent) -> None:
         self.last_anomaly = event
         log.warning("Anomaly: %s", "; ".join(event.reasons))
-        self._enter_hold("anomaly detected")
+        self._enter_hold("anomaly detected: " + "; ".join(event.reasons))
         self.hub.publish_event({"type": "anomaly", "event": event.model_dump()})
         if self.s.auto_analyze and self.loop is not None:
             fut = asyncio.run_coroutine_threadsafe(self.analyze("auto", event), self.loop)
@@ -489,7 +508,8 @@ class ControlLoop:
             objects, sam_source = await self.sam.segment(frame, clip)
             lat["sam_ms"] = round((time.perf_counter() - t0) * 1000)
 
-            attributions = compute_attributions(objects, saliency, self.homography)
+            deviation = self.reference.score(rec.telemetry.qpos_actual, saliency) if self.reference is not None else None
+            attributions = compute_attributions(objects, saliency, self.homography, deviation)
             ctx = self._diagnosis_context(anomaly, attributions, objects, saliency, rec)
             caption = "GlassBox keyframe | " + ("; ".join(anomaly.reasons) if anomaly else "manual analysis")
             composite = composite_keyframe(frame, saliency, objects, attributions, caption[:140])
@@ -729,7 +749,7 @@ class ControlLoop:
             self.ring.clear()
             self.latest_analysis_id = None  # past analyses stay readable by id; Q&A starts fresh
             self.history.clear()
-            self.saliency, self.last_target, self.last_anomaly = None, None, None
+            self.saliency, self.last_target, self.last_anomaly, self.attn_dev = None, None, None, None
             self.live_objects, self.live_attrs, self.live_views = [], [], []
             if self.state == ESTOP:
                 self.robot.resume_torque()
@@ -800,5 +820,6 @@ class ControlLoop:
                     "joint_error_deg": self.s.joint_error_threshold_deg,
                     "chunk_variance": self.s.chunk_variance_threshold,
                     "attention_hijack": self.s.attention_hijack_threshold,
+                    "attention_deviation": self.deviation_threshold,
                 },
             }

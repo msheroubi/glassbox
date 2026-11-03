@@ -48,7 +48,7 @@ const FIX_LABEL: Record<InterventionType, string> = {
   NONE: "Operator clears workspace, resume",
 };
 
-const NON_DISTRACTOR = new Set(["target", "gripper", "bin"]);
+const NON_DISTRACTOR = new Set(["target", "gripper", "goal"]);
 
 function SourceChip({ label, source }: { label: string; source: string | null | undefined }) {
   const cls = source === "meta-api" ? "ok" : source === "cache" ? "cache" : source ? "warn" : "off";

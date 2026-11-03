@@ -59,7 +59,7 @@ For every object GlassBox also reports:
 - the **workspace position in mm**, via a 4-point homography (`backend/robot/calibration.py`);
 - the IoU with the gripper mask.
 
-Masks labelled `target`, `gripper` and `bin` are never treated as distractors. The gripper
+Masks labelled `target`, `gripper` and `goal` (the green hex tile) are never treated as distractors. The gripper
 naturally draws attention while it hovers over the target.
 
 **Grasp bias.** For glare failures we also measure where the policy *thinks* the target is: the
@@ -76,10 +76,29 @@ can't stop the arm.
 
 | Trigger | Condition (defaults in `backend/config.py`) | Catches |
 |---|---|---|
-| Servo following error | `‖q_target − q_actual‖₂` over the 5 body joints > **12°** for **0.5 s** | Collisions, stalls, jams |
-| Action-chunk variance | Mean per-joint variance across every overlapping ACT chunk that predicts the current step > **25 deg²** for 0.4 s | Out-of-distribution confusion: the policy keeps changing its mind |
-| Attention hijack | A non-target object with **A > 0.45** for 0.5 s | Distractors that steal the policy's attention |
-| No progress | Shoulder/elbow joints move less than 4° over **4 s** | Silent failures: hovering, repeated missed grasps |
+| Servo following error | `‖q_target − q_actual‖₂` over the 5 body joints > **12°** for **0.5 s** while the arm is not moving (< 15°/s) | Collisions, stalls, jams |
+| Action-chunk variance | Mean per-joint variance across the ACT chunk predictions (within 2 replan intervals) that cover the current step > **25 deg²** for 0.4 s | Out-of-distribution confusion: the policy keeps changing its mind |
+| Attention deviation | More than the calibrated fraction (`calibration/attention_reference.npz`) of the policy's attention lies outside what the demos attended at the same arm pose, for **1 s** | Anything that pulls the policy's attention somewhere new: decoys, clutter, a hand |
+| Attention hijack (fallback) | A non-target object with **A > 0.45** for 0.5 s. Only used when there is no attention reference | Distractors that steal the policy's attention |
+| No progress | No joint (incl. the gripper) moves more than 4° over **4 s** | Silent failures: hovering, repeated missed grasps |
+
+**Why attention deviation, not "is it on the target".** A fixed rule breaks as soon as the policy has habits:
+the trained ACT checkpoint spends attention on an image corner, on the arm and on the goal tile, and that is
+fine. What matters is whether the attention differs from what it looked like in the demonstrations *at the
+same arm pose*. `scripts/build_attention_reference.py` replays the demos through the policy and stores
+(arm state, attention map). At run time `AttentionReference` looks up the demos at the 12 nearest poses
+(one per demo) and computes
+
+    excess = relu(blur(live) − max_demos(blur(demo)))        deviation = Σ excess   (live sums to 1)
+
+so the score is the share of attention that is somewhere no demo ever looked. `excess` also says where:
+each SAM object gets an `excess_share` (how much of the unexpected attention is inside it) next to its
+`expected_share` (the demos' attention there). That names the culprit and feeds Spark. Build and calibrate once:
+
+```bash
+PYTHONPATH=. python scripts/build_attention_reference.py --policy models/last/pretrained_model --dataset <so101 dataset dir>
+PYTHONPATH=. python scripts/calibrate_attention_reference.py   # leave-one-episode-out threshold
+```
 
 **Why chunk variance.** ACT predicts a chunk of future actions every few steps, and consecutive
 chunks overlap (`n_action_steps < chunk_size`). When the policy is confident, every chunk that

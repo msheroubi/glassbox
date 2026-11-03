@@ -62,8 +62,14 @@ LEFT = raw camera frame. RIGHT = the same frame with SAM 3.1 segmentation contou
 "#<mask_id> <label> A=<attention share>" and the policy's spatial saliency as a jet heatmap
 (red = where the policy is looking; saliency method: {saliency_method}).
 
-Attention-to-Mask Attribution: A(i) = sum of saliency inside mask i / total saliency. A distractor
-with A > {hijack_thr} means the policy's visual attention has been hijacked.
+Attention-to-Mask Attribution: A(i) = sum of saliency inside mask i / total saliency.
+Each object also carries expected_share (the share of attention in its mask in the demonstrations at the
+nearest arm poses) and excess_share (the fraction of *unexpected* attention, i.e. attention outside what the
+demos ever attended to at this pose, that lies inside the mask). "attention_deviation_from_demos" is the
+total unexpected fraction (0 to 1). When these are present, judge hijacking by them, not by A(i) alone: the
+policy legitimately looks at odd places, so a high A(i) with a matching expected_share is normal, and a
+distractor holding most of the excess_share is the culprit. Without them, a distractor with A > {hijack_thr}
+means the policy's visual attention has been hijacked.
 
 Failure taxonomy and the matching intervention:
 - ATTENTION_HIJACK: a non-target object captures the policy's attention -> INPAINT_MASK_SUPPRESSION
@@ -128,6 +134,9 @@ class DiagnosisContext:
                 "action_chunk_variance_at_anomaly": round(self.latest.action_chunk_variance, 2),
                 "action_chunk_variance_peak_10s": round(self.peak_chunk_variance, 2),
             },
+            "attention_deviation_from_demos": None
+            if not any(a.excess_share is not None for a in self.attributions)
+            else round(self.latest.attention_deviation, 3),
             "gripper_xy_mm": [round(v, 1) for v in self.gripper_xy_mm],
             "policy_phase": self.policy_phase,
             "target_grasp_bias_mm": None
@@ -258,20 +267,38 @@ def local_diagnosis(ctx: DiagnosisContext, hijack_thr: float, je_thr: float) -> 
         )
 
     distractors = [a for a in attrs if a.label not in NON_DISTRACTOR_LABELS | {"hand"}]
-    top = max(distractors, key=lambda a: a.attention_share, default=None)
-    if top is not None and top.attention_share > hijack_thr:
+    has_ref = any(a.excess_share is not None for a in attrs)
+    if has_ref:  # attention vs the demos at this pose: the culprit holds the unexpected attention
+        top = max(distractors, key=lambda a: a.excess_share or 0.0, default=None)
+        is_hijack = top is not None and (top.excess_share or 0.0) >= 0.3 and ctx.latest.attention_deviation > 0.05
+    else:
+        top = max(distractors, key=lambda a: a.attention_share, default=None)
+        is_hijack = top is not None and top.attention_share > hijack_thr
+    if top is not None and is_hijack:
         target = (by_label.get("target") or [None])[0]
         tgt = f" versus A={target.attention_share:.2f} on the target" if target else ""
+        if has_ref:
+            evidence = (
+                f"{ctx.latest.attention_deviation:.0%} of the policy's attention is somewhere it never looked at this "
+                f"arm pose in the demonstrations, and {top.excess_share:.0%} of that unexpected attention is on mask "
+                f"#{top.mask_id} ({top.label}; A={top.attention_share:.2f}, demos expected {top.expected_share or 0:.2f})"
+            )
+            conf = 0.6 + min(top.excess_share or 0.0, 1.0) * 0.35
+        else:
+            evidence = (
+                f"Attention-to-mask attribution gives A={top.attention_share:.2f} on mask #{top.mask_id} "
+                f"({top.label}){tgt}, above the {hijack_thr} hijack threshold"
+            )
+            conf = 0.55 + top.attention_share / 2
         return XAIDiagnosisResponse(
             failure_detected=True,
             failure_type="ATTENTION_HIJACK",
             culprit_mask_id=top.mask_id,
-            confidence=float(np.clip(0.55 + top.attention_share / 2, 0, 0.97)),
-            headline_summary=f"The policy is staring at the {top.label} (#{top.mask_id}) instead of the target.",
+            confidence=float(np.clip(conf, 0, 0.97)),
+            headline_summary=f"The policy's attention has been pulled onto the {top.label} (#{top.mask_id}).",
             technical_root_cause=(
-                f"Attention-to-mask attribution gives A={top.attention_share:.2f} on mask #{top.mask_id} "
-                f"({top.label}){tgt}, above the {hijack_thr} hijack threshold. Action-chunk variance peaked at "
-                f"{ctx.peak_chunk_variance:.1f}: the policy is split between two look-alike goals and hovers."
+                f"{evidence}. Action-chunk variance peaked at {ctx.peak_chunk_variance:.1f}: the policy is "
+                "distracted by an object it did not see in training and hesitates."
             ),
             intervention_type="INPAINT_MASK_SUPPRESSION",
             intervention_parameters={"mask_id": top.mask_id, "dilate_px": 15},

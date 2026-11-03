@@ -247,12 +247,14 @@ class PlanarKinematics:
 
 
 SCENARIOS = {
-    "nominal": "Clean table: the policy picks the red cube and drops it in the bin.",
+    "nominal": "Clean table: the policy picks the red cube and places it on the green hex tile.",
     "attention_hijack": "A large red ball shares the policy's colour cue and hijacks its attention.",
     "servo_stall": "A cardboard box sits on the straight-line reach path; the gripper jams against it.",
     "occlusion": "An operator's hand reaches over and occludes the cube mid-reach.",
     "specular_glare": "A specular highlight washes out most of the cube, biasing the grasp point.",
 }
+
+TILE_RADIUS_MM = 70.0  # circumradius of the simulated Catan-style goal tile
 
 HOME_Q = np.array([0.0, *PlanarKinematics().ik(120.0, 0.0)[1:], 0.0, 0.0, 60.0])
 
@@ -287,7 +289,7 @@ class MockSO101:
             self.qvel = np.zeros(6)
             self.load = np.zeros(6)
             self.cube_xy = np.array([240.0, -60.0])
-            self.bin_xy_mm = (150.0, 215.0)
+            self.goal_xy_mm = (150.0, 215.0)
             self.holding = False
             self.delivered = False
             self.torque_enabled = True
@@ -395,8 +397,7 @@ class MockSO101:
             self.cube_xy = gxy.copy()
             if self.q[5] > 40.0:
                 self.holding = False
-                bx, by = self.bin_xy_mm
-                self.delivered = abs(gxy[0] - bx) < 55 and abs(gxy[1] - by) < 70
+                self.delivered = self._on_tile(gxy)
 
     # ------------------------------------------------------------------ rendering
     def _poly_px(self, pts_mm) -> np.ndarray:
@@ -418,12 +419,22 @@ class MockSO101:
     def _rect_mm(self, cx, cy, half) -> list[tuple[float, float]]:
         return [(cx - half, cy - half), (cx + half, cy - half), (cx + half, cy + half), (cx - half, cy + half)]
 
+    def _tile_mm(self, scale: float = 1.0) -> list[tuple[float, float]]:
+        cx, cy = self.goal_xy_mm
+        r = TILE_RADIUS_MM * scale
+        return [(cx + r * math.cos(math.radians(30 + 60 * k)), cy + r * math.sin(math.radians(30 + 60 * k))) for k in range(6)]
+
+    def _on_tile(self, xy: np.ndarray) -> bool:
+        """Point-in-hexagon test for the (pointy-along-y) goal tile."""
+        dx, dy = abs(xy[0] - self.goal_xy_mm[0]), abs(xy[1] - self.goal_xy_mm[1])
+        return dx <= TILE_RADIUS_MM * math.sqrt(3) / 2 and dy <= TILE_RADIUS_MM - dx / math.sqrt(3)
+
     def _draw_objects(self, img: np.ndarray, t: float) -> None:
-        # bin
-        bx, by = self.bin_xy_mm
-        bin_poly = self._poly_px([(bx - 55, by - 70), (bx + 55, by - 70), (bx + 55, by + 70), (bx - 55, by + 70)])
-        cv2.fillPoly(img, [bin_poly], (150, 95, 40))
-        cv2.polylines(img, [bin_poly], True, (90, 55, 20), 6)
+        # goal: green hex tile
+        tile = self._poly_px(self._tile_mm())
+        cv2.fillPoly(img, [tile], (70, 165, 55))
+        cv2.fillPoly(img, [self._poly_px(self._tile_mm(0.78))], (85, 185, 70))
+        cv2.polylines(img, [tile], True, (35, 100, 25), 6, cv2.LINE_AA)
         # obstacle box
         if self.box is not None:
             x0, x1, y0, y1 = self.box
@@ -507,6 +518,9 @@ class MockSO101:
             m = blank()
             cv2.fillPoly(m, [self._poly_px(self._rect_mm(*self.cube_xy, self.CUBE_MM / 2))], 1)
             objs.append(GroundTruthObject("target", concepts.get("target", "cube"), m.astype(bool)))
+            m = blank()
+            cv2.fillPoly(m, [self._poly_px(self._tile_mm())], 1)
+            objs.append(GroundTruthObject("goal", concepts.get("goal", "green hex tile"), m.astype(bool)))
             if self.ball_xy is not None:
                 m = blank()
                 c = tuple(int(v) for v in self.hom.workspace_to_pixel(*self.ball_xy))

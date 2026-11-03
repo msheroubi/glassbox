@@ -16,6 +16,7 @@ LABEL_COLOURS = {  # BGR
     "target": (80, 220, 80),
     "distractor": (255, 0, 255),
     "obstacle": (0, 165, 255),
+    "goal": (200, 220, 40),
     "hand": (0, 255, 255),
 }
 

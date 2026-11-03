@@ -55,7 +55,7 @@ that falls inside the mask.
 **Anomaly triggers** (`backend/xai_engine/attribution.py`):
 - Joint following error above 12° for 0.5 s.
 - Action-chunk variance above 25 deg² across overlapping ACT chunks, an out-of-distribution signal.
-- Attention hijack: a non-target object with `A > 0.45`.
+- Attention deviation: the policy's attention leaves what the demos attended at the same arm pose (`calibration/attention_reference.npz`); without that file, a non-target object with `A > 0.45`.
 - No task progress for 4 s.
 
 A trigger pauses the arm (HOLD) and starts the analysis automatically, unless you pass
