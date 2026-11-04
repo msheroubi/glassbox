@@ -80,8 +80,8 @@ class AttentionReference:
         z["threshold"] = np.float32(threshold)
         np.savez_compressed(path, **z)
 
-    def score(self, qpos: np.ndarray, saliency: np.ndarray, exclude_episode: int | None = None) -> Deviation:
-        live = to_grid(saliency)
+    def neighbours(self, qpos: np.ndarray, exclude_episode: int | None = None) -> tuple[list[int], float]:
+        """Bank indices of the nearest demo pose in each of the N_DEMOS closest demonstrations, and the closest distance."""
         q = np.asarray(qpos[:6], np.float32) / self.scale
         d = np.linalg.norm(self.feat - q, axis=1)
         best_idx, best_d = [], []
@@ -93,12 +93,16 @@ class AttentionReference:
             best_idx.append(j)
             best_d.append(d[j])
         keep = np.argsort(best_d)[:N_DEMOS]
-        idx = [best_idx[i] for i in keep]
+        return [best_idx[i] for i in keep], float(np.min(best_d))
+
+    def score(self, qpos: np.ndarray, saliency: np.ndarray, exclude_episode: int | None = None) -> Deviation:
+        live = to_grid(saliency)
+        idx, pose_dist = self.neighbours(qpos, exclude_episode)
         envelope = self.blurred[idx].max(axis=0) + MARGIN
         excess = np.clip(_blur(live) - envelope, 0, None)
         # blur spreads mass slightly, so normalise by the blurred total to keep the score in 0..1
         score = float(excess.sum() / max(float(_blur(live).sum()), 1e-9))
-        return Deviation(score, excess, self.maps[idx].mean(axis=0), float(np.min(best_d)))
+        return Deviation(score, excess, self.maps[idx].mean(axis=0), pose_dist)
 
     def calibrate(self, quantile: float = 0.995, slack: float = 1.3, floor: float = 0.1) -> dict[str, float]:
         """Leave-one-episode-out scores over the bank itself -> a threshold above normal run-to-run variation."""

@@ -6,7 +6,7 @@ feed each other:
 ```
 SAM 3.1 masks ──► A(i) numbers ──► Muse Spark diagnosis ──► Muse Wonder plan ──► validated waypoints
      │                                   │      │
-     │                                   │      └──► Muse Image counterfactual ("what it should have seen")
+     │                                   │      └──► Muse Image counterfactual test ("without the culprit, would it look elsewhere?")
      └── re-tracks the suppressed object every 3 s while the fix runs
 Muse Voice Transcribe ──► spoken commands / questions ──► Muse Spark answers grounded in the same evidence
 ```
@@ -103,6 +103,29 @@ stalls.
 
 ---
 
+## Muse Wonder: the forensic breakdown of a replayed failure
+
+`backend/meta_clients/wonder_breakdown.py`
+
+Spark triages from one keyframe in seconds. Once a failed run has been replayed offline (see
+[04 §6](04-explainability.md#6-failure-replay-a-second-slower-look-at-the-run)), Wonder gets the whole
+story:
+- a filmstrip of four keyframes of what the policy saw, with SAM contours and the attention heatmap;
+- the attention share of every object over time, for every map (ACT live, plus the replay lens: SAM 3's
+  "red cube" / "green hex tile" maps, labelled as perception rather than attention, or SmolVLA's two maps);
+- the detected attention shifts, the servo telemetry and Spark's triage.
+
+It returns a `FailureBreakdown` (JSON schema enforced):
+- `failure_stage`: `PERCEPTION`, `DECISION` or `ACTUATION`. The brief states the thesis under test and
+  tells Wonder to call perception only when the attention evidence supports it;
+- the culprit's SAM label, a perception analysis and a root cause citing the numbers;
+- a timeline (each entry seeks the replay when clicked) and a counterfactual;
+- `self_correctable`, `needs_human` and `human_action`, plus the intervention and its parameters.
+
+`_consistent()` keeps the flags coherent with the intervention whatever the model writes: a `NONE`
+intervention can never be self-correctable. If Wonder rejects the image, the request is retried
+text-only. Without the API, `local_breakdown()` applies deterministic rules to the same evidence.
+
 ## Muse Wonder: physical reasoning for recovery motions
 `backend/meta_clients/wonder_planner.py`
 
@@ -137,28 +160,58 @@ Wonder's refined plan replaces it in the UI when it arrives (`analysis_update`).
 
 ---
 
-## Muse Image: the counterfactual ("what the policy should have seen")
-`backend/meta_clients/voice_and_image.py: CounterfactualRenderer`
+## Muse Image: the counterfactual test ("would it have looked elsewhere without it?")
+`backend/xai_engine/counterfactual.py`, `ControlLoop.counterfactual`, `CounterfactualRenderer`
 
-After a diagnosis, the anomaly frame is sent to `POST /v1/images/edits` with an instruction built
-from the diagnosis and SAM:
-- the culprit's own noun phrase;
-- its coarse location ("upper left");
-- an explicit list of what to keep unchanged.
+Correlation (the attention overlaps the book) isn't causation. So GlassBox removes the suspect from
+the failure frame and asks the policy again: **same joint state, edited frame**. Then it compares
+where the policy looks and where its predicted reach goes.
 
-| Failure | Edit instruction |
-|---|---|
-| Attention hijack | "Remove only the red ball in the upper left of the image from the table, showing bare table where it was. Keep the red cube, the robot arm, …" |
-| Occlusion | "Remove the human hand and arm from the scene so the red cube underneath is fully visible …" |
-| Specular glare | "Remove the white specular glare from the red cube so the whole cube is evenly lit, matte red …" |
-| Collision | "Remove only the cardboard box …" |
+**What gets removed** (`choose_edit`): a distractor in the scene is always the suspect, whatever
+the diagnosis guessed first. From one frame, Spark often calls the book's sheen "glare on the
+target", and repainting glare tests nothing. A hand is removed for occlusion. Glare is only removed
+from the target, and only when there is no distractor.
 
-The result is overlaid with the planned recovery path as a ghost line. It is a visual explanation
-for people: "this is the scene your policy was trained on; this one thing was different." It is
-also a preview of what Real-Time Mask Suppression will feed the policy.
+**Where** (`plan_edit`, `removal_region`): Muse Image's edit endpoint takes no mask, and a free-form
+"remove the book" redraws the frame (or the book). So the region comes from SAM:
+1. Grow SAM's mask over the parts SAM missed but that belong to the object in the picture (dark
+   side faces, edges, contact shadow), never into the target, goal or arm.
+2. `erase_local`: fill the region with the empty-table plate (or Telea inpainting), so the object
+   is gone before Muse sees the frame. Muse is only asked to make the patch look like table.
+3. `align` + `composite`: undo Muse's small shift or scale (ECC), then paste its pixels back
+   **inside the feathered region only**. Everything else is the original frame, pixel for pixel.
+4. Validate: if the culprit's colour survives (`culprit_still_visible`) or the patch doesn't match
+   the table around it (`looks_like_table`), use the local erase instead.
 
-**Fallback.** The culprit mask is filled with the calibrated empty-table background plate, the
-same operation the live suppressor performs, or Telea inpainting.
+**Asking again.** Every available attention model (ACT live, and SmolVLA's two maps when it is the replay
+lens) attends the edited frame. SAM 3's maps are left out: without the suspect, it trivially stops finding
+it. `compare_maps` reports, all measured in the pre-edit masks:
+- how much attention **moved** (total-variation distance);
+- each label's share inside its mask and **near** it (its neighbourhood, see
+  [04 §2](04-explainability.md#2-ai-attention-to-mask-attribution)) before and after;
+- the **flow**: of the attention that moved, the fraction that left each neighbourhood (`left_from`) and
+  arrived in it (`arrived_at`), each compared with the neighbourhood's area (`area`);
+- the label nearest the map's hottest point before and after (`peak_before`, `peak_after`).
+
+ACT's predicted chunk is projected as a reach path (red: with, green: without). `assess` gives the
+`outcome`, judged on the acting policy's map (ACT when it drove the arm):
+- **confirmed**: at least 25 % moved, or the reach shifted ≥ 15 px;
+- **implicated**: less moved, but it moved *from around the suspect* (≥ 20 % of the moved attention
+  left its neighbourhood, at ≥ 2.5× that neighbourhood's area), or the hottest spot sat next to the
+  suspect and left with it;
+- **ruled out**: under 15 % moved, the reach ends < 15 px from where it did, and nothing concentrated
+  left the suspect or the peak;
+- **partial**: anything else.
+
+Only the in-mask share would miss a hijack: coarse maps put ~1 % inside a small mask even when their
+hot spot hugs it. A reach that is no closer to the cube without the suspect doesn't clear it either:
+it is one re-plan from the failure pose, after the policy has already committed.
+
+This goes to Muse Wonder as `counterfactual_test` and **outranks the attention correlation**: only a
+ruled-out suspect is cleared, even if it got attention.
+
+In the console, the counterfactual card wipes between the frame as the policy saw it and the edited
+frame (dashed: the SAM region), or between the two attention maps.
 
 ---
 

@@ -1,4 +1,4 @@
-import type { AnalysisResult, AskResponse, HistoryPoint, InterventionType, RuntimeStatus } from "./types";
+import type { AnalysisResult, AskResponse, HistoryPoint, InterventionType, ReplayResult, RuntimeStatus, SavedRun } from "./types";
 
 export class ApiError extends Error {
   constructor(public status: number, message: string) {
@@ -41,7 +41,16 @@ export const api = {
   resume: () => request<RuntimeStatus>("POST", "/api/resume"),
   ask: (question: string) => request<AskResponse>("POST", "/api/ask", { question }),
   buffer: () => request<{ frames: HistoryPoint[] }>("GET", "/api/buffer"),
+  hold: () => request<RuntimeStatus>("POST", "/api/hold"),
+  settings: (patch: { self_correct?: boolean }) => request<RuntimeStatus>("POST", "/api/settings", patch),
+  replays: () => request<{ runs: SavedRun[]; latest_id: string | null }>("GET", "/api/replays"),
+  replay: (id: string) => request<ReplayResult>("GET", `/api/replay/${id}`),
+  openReplay: (id: string) => request<ReplayResult>("POST", `/api/replay/${id}/open`),
+  applyReplayFix: (id: string) => request<{ ok: boolean; message: string }>("POST", `/api/replay/${id}/apply`),
 };
+
+export const replayFrameUrl = (id: string, index: number, view: "policy" | "raw") =>
+  `/api/replay/${id}/frame/${index}.jpg?view=${view}`;
 
 export const bufferFrameUrl = (index: number, overlay = true) => `/api/buffer/${index}.jpg?overlay=${overlay}`;
 

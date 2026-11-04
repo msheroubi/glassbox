@@ -7,6 +7,7 @@ Attention-to-Mask Attribution Score for object i with mask M_i and saliency S(u,
 
 from __future__ import annotations
 
+import base64
 from collections import deque
 from dataclasses import dataclass
 
@@ -61,9 +62,198 @@ def attention_share(saliency: np.ndarray, mask: np.ndarray) -> float:
     return float(saliency[mask].sum() / (saliency.sum() + 1e-6))
 
 
+def grid_b64(saliency: np.ndarray, grid_wh: tuple[int, int]) -> str:
+    small = cv2.resize(saliency.astype(np.float32), grid_wh, interpolation=cv2.INTER_AREA)
+    return base64.b64encode(np.clip(small * 255, 0, 255).astype(np.uint8).tobytes()).decode()
+
+
+def label_shares(saliency: np.ndarray, objects: list[SegmentedObject]) -> dict[str, float]:
+    total = float(saliency.sum()) + 1e-6
+    unions: dict[str, np.ndarray] = {}
+    for o in objects:
+        unions[o.label] = o.mask if o.label not in unions else np.logical_or(unions[o.label], o.mask)
+    return {lab: round(float(saliency[m].sum()) / total, 4) for lab, m in unions.items()}
+
+
+# "Near" an object: within this fraction of the frame width of its SAM mask, and closer to it than to any other
+# object. Attention maps are coarse (one cell per backbone feature or ViT patch) and diffuse, so the share
+# strictly inside a small mask is ~1% even when the hot spot sits right on the object's edge.
+NEAR_RADIUS_FRAC = 0.09  # ~58 px at 640 wide: a feature cell or two beyond SAM's tight mask edges
+NEAR_WORK_W = 320  # neighbourhoods are computed at this width (shares don't depend on the resolution)
+NEAR_DRAW_LIFT = 1.3  # an object "draws" attention when its neighbourhood holds this many times its uniform share
+
+
+@dataclass
+class Neighbourhoods:
+    """Each label's neighbourhood (a nearest-object partition of the pixels within reach of some mask)."""
+
+    regions: dict[str, np.ndarray]  # label -> bool at the working resolution
+    size_wh: tuple[int, int]
+
+    def fit(self, saliency: np.ndarray) -> np.ndarray:
+        """``saliency`` at the working resolution, normalised to sum to 1."""
+        s = np.clip(saliency.astype(np.float32), 0, None)
+        if s.shape[:2] != (self.size_wh[1], self.size_wh[0]):
+            s = cv2.resize(s, self.size_wh, interpolation=cv2.INTER_AREA)
+        s = s.astype(np.float64)
+        return s / (s.sum() + 1e-12)
+
+    def area(self) -> dict[str, float]:
+        """Fraction of the frame each neighbourhood covers: the share a uniform map would put there."""
+        return {lab: round(float(r.mean()), 4) for lab, r in self.regions.items()}
+
+    def sums(self, field: np.ndarray) -> dict[str, float]:
+        return {lab: round(float(field[r].sum()), 4) for lab, r in self.regions.items()}
+
+    def label_at(self, x: int, y: int) -> str | None:
+        return next((lab for lab, r in self.regions.items() if r[y, x]), None)
+
+
+def neighbourhoods(objects: list[SegmentedObject]) -> Neighbourhoods | None:
+    masks = [o for o in objects if o.mask.any()]
+    if not masks:
+        return None
+    h, w = masks[0].mask.shape[:2]
+    k = min(1.0, NEAR_WORK_W / w)
+    size = (max(1, round(w * k)), max(1, round(h * k)))
+    unions: dict[str, np.ndarray] = {}
+    for o in masks:
+        m = cv2.resize(o.mask.astype(np.float32), size, interpolation=cv2.INTER_AREA) > 0
+        unions[o.label] = m if o.label not in unions else unions[o.label] | m
+    labels = list(unions)
+    dist = np.stack([cv2.distanceTransform((~unions[lab]).astype(np.uint8), cv2.DIST_L2, 5) for lab in labels])
+    nearest, within = dist.argmin(0), dist.min(0) <= NEAR_RADIUS_FRAC * size[0]
+    return Neighbourhoods({lab: (nearest == i) & within for i, lab in enumerate(labels)}, size)
+
+
+def near_shares(
+    saliency: np.ndarray, objects: list[SegmentedObject], nb: Neighbourhoods | None = None
+) -> tuple[dict[str, float], dict[str, float]]:
+    """``(share, lift)`` per label: the attention near each object, and that share over the neighbourhood's
+    area (1 = what a uniform map gives it, 2 = twice as concentrated there as anywhere on average)."""
+    nb = nb or neighbourhoods(objects)
+    if nb is None:
+        return {}, {}
+    share, area = nb.sums(nb.fit(saliency)), nb.area()
+    return share, {lab: round(share[lab] / area[lab], 2) if area[lab] > 0 else 0.0 for lab in share}
+
+
 def iou(a: np.ndarray, b: np.ndarray) -> float:
     union = np.logical_or(a, b).sum()
     return float(np.logical_and(a, b).sum() / union) if union else 0.0
+
+
+SINGLE_INSTANCE_LABELS = {"target", "gripper", "goal"}  # roles with exactly one object in the scene
+DUPLICATE_IOU = 0.6
+PRESENCE_PRIOR = 0.15  # bonus for explaining a single-instance role SAM reported (the target is in the scene)
+
+# Appearance vote (Settings.appearance_refs): SAM's "red cube" and "red book" scores are near coin flips on
+# the real rig, but the two objects' colours are ~23 LAB units apart and stable across runs and positions.
+APPEARANCE_SIGMA = 8.0  # LAB units
+APPEARANCE_MAX = 30.0  # farther than this from every reference: some other object or other lighting, no vote
+APPEARANCE_WEIGHT = 1.0  # a decisive colour outweighs SAM's confidence gap (which rarely exceeds 0.4)
+APPEARANCE_L_WEIGHT = 0.5  # lightness depends on where the object sits under the lamp; hue less so
+ALT_CONFIDENCE = 0.3  # SAM score assumed for a reference label SAM didn't return for this object
+
+
+def appearance(lab: np.ndarray, sat: np.ndarray, mask: np.ndarray) -> np.ndarray | None:
+    """Median LAB of the object's saturated pixels: its colour, not its glare or the table at its edges.
+
+    ``lab`` is the frame in OpenCV 8-bit LAB, ``sat`` its HSV saturation."""
+    m = mask.astype(bool)
+    if m.shape != sat.shape:
+        return None
+    px = m & (sat > 70)
+    if px.sum() < 20:
+        return None
+    return np.median(lab[px].astype(np.float32), axis=0)
+
+
+def appearance_votes(colour: np.ndarray | None, refs: dict[str, list[float]] | None) -> dict[str, float]:
+    """``P(label | colour)`` over the reference labels; empty when the colour is close to none of them."""
+    if colour is None or not refs:
+        return {}
+    w = np.array([APPEARANCE_L_WEIGHT, 1.0, 1.0], np.float32)
+    d = {k: float(np.linalg.norm((colour - np.asarray(v, np.float32)) * w)) for k, v in refs.items()}
+    if min(d.values()) > APPEARANCE_MAX:
+        return {}
+    like = {k: float(np.exp(-0.5 * (x / APPEARANCE_SIGMA) ** 2)) for k, x in d.items()}
+    total = sum(like.values())
+    return {k: v / total for k, v in like.items()} if total > 1e-12 else {}
+
+
+def dedupe_objects(
+    objects: list[SegmentedObject], frame: np.ndarray | None = None,
+    appearance_refs: dict[str, list[float]] | None = None, prompts: dict[str, str] | None = None,
+) -> list[SegmentedObject]:
+    """Merge masks of one physical object that SAM returned under several concepts, and label each one.
+
+    SAM segments each concept independently, so the red book also comes back as "red cube" and the cube
+    as "red book". Overlapping masks become one object, and the labels of contested objects are chosen
+    jointly: each single-instance role (one target) is used at most once, and the assignment maximises total
+    confidence plus a small bonus per single-instance role it covers. Per-object "highest confidence wins"
+    mislabels the cube whenever SAM rates it a slightly better book than a cube.
+
+    With ``frame`` and ``appearance_refs`` ({label: LAB colour}), an object SAM gave one of those labels
+    also gets a colour vote for each of them, so the cube is the target even when SAM only called it a book.
+    ``prompts`` ({label: noun phrase}) names an object relabelled that way."""
+    clusters: list[list[SegmentedObject]] = []
+    for o in objects:
+        for c in clusters:
+            if any(iou(o.mask, p.mask) > DUPLICATE_IOU for p in c):
+                c.append(o)
+                break
+        else:
+            clusters.append([o])
+
+    def conf(o: SegmentedObject) -> float:
+        return 0.5 if o.confidence is None else float(o.confidence)
+
+    lab = sat = None
+    if frame is not None and appearance_refs:
+        lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+        sat = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)[..., 1]
+    options: list[dict[str, float]] = []
+    for c in clusters:
+        opt = {lab_: max(conf(o) for o in c if o.label == lab_) for lab_ in {o.label for o in c}}
+        if lab is not None and set(opt) & set(appearance_refs):
+            union = np.logical_or.reduce([o.mask for o in c])
+            for lab_, p in appearance_votes(appearance(lab, sat, union), appearance_refs).items():
+                opt[lab_] = opt.get(lab_, ALT_CONFIDENCE) + APPEARANCE_WEIGHT * p
+        options.append(opt)
+    choice = [next(iter(opt)) if len(opt) == 1 else None for opt in options]
+    contested = [i for i, ch in enumerate(choice) if ch is None]
+    taken = {ch for ch in choice if ch in SINGLE_INSTANCE_LABELS}
+    best: tuple[float, list[str]] | None = None
+
+    def search(j: int, picked: list[str], used: set[str], score: float) -> None:
+        nonlocal best
+        if j == len(contested):
+            if best is None or score > best[0]:
+                best = (score, picked.copy())
+            return
+        for lab_, sc in options[contested[j]].items():
+            if lab_ in SINGLE_INSTANCE_LABELS and lab_ in used:
+                continue
+            picked.append(lab_)
+            single = lab_ in SINGLE_INSTANCE_LABELS
+            search(j + 1, picked, used | ({lab_} if single else set()), score + sc + (PRESENCE_PRIOR if single else 0.0))
+            picked.pop()
+
+    if contested and len(contested) <= 8:
+        search(0, [], taken, 0.0)
+    for k, i in enumerate(contested):
+        choice[i] = best[1][k] if best is not None else max(options[i], key=options[i].get)
+
+    out = []
+    for c, lab_ in zip(clusters, choice):
+        same = [o for o in c if o.label == lab_]
+        rep = max(same or c, key=conf)
+        prompt = rep.prompt if same else (prompts or {}).get(lab_) or next(
+            (o.prompt for o in objects if o.label == lab_), lab_)
+        mask = np.logical_or.reduce([o.mask for o in c]) if len(c) > 1 else rep.mask
+        out.append(SegmentedObject(len(out), lab_, prompt, mask, rep.confidence, rep.source))
+    return out
 
 
 def centroid(mask: np.ndarray) -> tuple[int, int]:
@@ -129,6 +319,7 @@ class AnomalyDetector:
         disabled: frozenset[str] = frozenset(),
         deviation_threshold: float | None = None,
         deviation_hold_s: float = 1.0,
+        hijack_excess_threshold: float = 0.15,
     ) -> None:
         self.disabled = disabled  # any of: servo, variance, hijack, stall, deviation
         self.hz = hz
@@ -141,6 +332,7 @@ class AnomalyDetector:
         self.stall_window = max(2, int(stall_window_s * hz))
         # With an attention reference, "attention left what the demos did" replaces the fixed A(i) rule.
         self.dev_thr = deviation_threshold
+        self.hijack_excess_thr = hijack_excess_threshold
         self.dev_hold = max(1, int(deviation_hold_s * hz))
         self.reset()
 
@@ -157,11 +349,18 @@ class AnomalyDetector:
         # Tracking lag while the arm moves is normal; a collision shows as large error with no motion.
         self.je_count = self.je_count + 1 if tel.joint_error > self.je_thr and speed < STALL_SPEED_DEG_S else 0
         self.var_count = self.var_count + 1 if tel.action_chunk_variance > self.var_thr else 0
-        max_share, top = 0.0, None
+        # A(i), or with an attention reference A(i) minus what the demos attended there at this pose
+        # (a habitual hot spot is not a hijack, the same share on something new is).
+        def surprise(a: MaskAttribution) -> float:
+            return a.attention_share - a.expected_share if a.expected_share is not None else a.attention_share
+
+        max_share, top, hijack_thr = 0.0, None, self.hijack_thr
         if attributions:
-            top = max((a for a in attributions if a.label not in NON_DISTRACTOR_LABELS), key=lambda a: a.attention_share, default=None)
-            max_share = top.attention_share if top else 0.0
-        self.hijack_count = self.hijack_count + 1 if max_share > self.hijack_thr else 0
+            top = max((a for a in attributions if a.label not in NON_DISTRACTOR_LABELS), key=surprise, default=None)
+            max_share = surprise(top) if top else 0.0
+            if top is not None and top.expected_share is not None:
+                hijack_thr = self.hijack_excess_thr
+        self.hijack_count = self.hijack_count + 1 if max_share > hijack_thr else 0
 
         self.dev_count = self.dev_count + 1 if self.dev_thr is not None and tel.attention_deviation > self.dev_thr else 0
 
@@ -180,7 +379,13 @@ class AnomalyDetector:
         if self.var_count >= self.var_hold and "variance" not in self.disabled:
             reasons.append(f"action-chunk variance {tel.action_chunk_variance:.1f} > {self.var_thr} (OOD confusion)")
         if self.hijack_count >= self.hijack_hold and "hijack" not in self.disabled:
-            reasons.append(f"attention share on non-target '{top.label}' #{top.mask_id} A={max_share:.2f} > {self.hijack_thr}")
+            if top.expected_share is not None:
+                reasons.append(
+                    f"attention on '{top.label}' #{top.mask_id} is A={top.attention_share:.2f} but the demos had "
+                    f"{top.expected_share:.2f} there at this pose (+{max_share:.2f} > {hijack_thr})"
+                )
+            else:
+                reasons.append(f"attention share on non-target '{top.label}' #{top.mask_id} A={max_share:.2f} > {hijack_thr}")
         if len(self.qpos_hist) == self.stall_window and "stall" not in self.disabled:
             spread = np.ptp(np.stack(self.qpos_hist), axis=0).max()
             if spread < 4.0:

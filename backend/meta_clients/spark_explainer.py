@@ -269,8 +269,13 @@ def local_diagnosis(ctx: DiagnosisContext, hijack_thr: float, je_thr: float) -> 
     distractors = [a for a in attrs if a.label not in NON_DISTRACTOR_LABELS | {"hand"}]
     has_ref = any(a.excess_share is not None for a in attrs)
     if has_ref:  # attention vs the demos at this pose: the culprit holds the unexpected attention
-        top = max(distractors, key=lambda a: a.excess_share or 0.0, default=None)
-        is_hijack = top is not None and (top.excess_share or 0.0) >= 0.3 and ctx.latest.attention_deviation > 0.05
+        def surprise(a: MaskAttribution) -> float:
+            return a.attention_share - (a.expected_share or 0.0)
+
+        top = max(distractors, key=lambda a: (a.excess_share or 0.0, surprise(a)), default=None)
+        is_hijack = top is not None and (
+            ((top.excess_share or 0.0) >= 0.3 and ctx.latest.attention_deviation > 0.05) or surprise(top) > 0.15
+        )
     else:
         top = max(distractors, key=lambda a: a.attention_share, default=None)
         is_hijack = top is not None and top.attention_share > hijack_thr
@@ -373,6 +378,31 @@ def local_diagnosis(ctx: DiagnosisContext, hijack_thr: float, je_thr: float) -> 
         ),
         intervention_type="NONE",
         intervention_parameters={},
+    )
+
+
+def forced_diagnosis(ctx: DiagnosisContext) -> XAIDiagnosisResponse | None:
+    """Demo: the operator declared a failure the evidence alone doesn't show. Blame the distractor holding the most
+    attention (the counterfactual test and the replay then judge it), or None if there is no distractor."""
+    distractors = [a for a in ctx.attributions if a.label not in NON_DISTRACTOR_LABELS | {"hand", "obstacle"}]
+    top = max(distractors, key=lambda a: a.attention_share, default=None)
+    if top is None:
+        return None
+    target = next((a for a in ctx.attributions if a.label == "target"), None)
+    tgt = f" against A={target.attention_share:.2f} on the target" if target else ""
+    return XAIDiagnosisResponse(
+        failure_detected=True,
+        failure_type="ATTENTION_HIJACK",
+        culprit_mask_id=top.mask_id,
+        confidence=0.5,
+        headline_summary=f"The policy's attention has been pulled onto the {top.label} (#{top.mask_id}).",
+        technical_root_cause=(
+            f"Failure triggered by the operator (demo). Mask #{top.mask_id} ({top.label}) holds A={top.attention_share:.2f} "
+            f"of the policy's attention{tgt}, the largest share on any object outside the task, so it is the prime "
+            "suspect even though it stayed below the automatic hijack trigger."
+        ),
+        intervention_type="INPAINT_MASK_SUPPRESSION",
+        intervention_parameters={"mask_id": top.mask_id, "dilate_px": 15},
     )
 
 

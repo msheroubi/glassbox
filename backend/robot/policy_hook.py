@@ -15,11 +15,16 @@ norm of the layer4 activations is used instead.
 ``MockPolicy`` is the stand-in for ``--mock-hardware``: an image-driven pick-and-place controller
 whose "attention" is a colour-saliency map of the frame it is fed. Because it only sees pixels,
 mask suppression changes its behaviour for the same causal reason it changes a real ACT policy's.
+
+Every policy also has ``attend(state, frame_bgr) -> (saliency, method, chunk)``: an observe-only pass with
+no side effects on the running policy (queue, variance tracker), used to ask "where would it look, and
+where would it go, in this edited frame?" for counterfactuals.
 """
 
 from __future__ import annotations
 
 import logging
+import threading
 from collections import deque
 from dataclasses import dataclass, field
 
@@ -119,6 +124,8 @@ class ACTRunner:
         self.variance = ChunkVarianceTracker(horizon=2 * (self.observe_every or self.n_action_steps))
         self.queue: deque[np.ndarray] = deque()
         self.step_idx = 0
+        self._infer_lock = threading.Lock()  # the hooks share state: one forward pass at a time
+        self._last_images: dict[str, np.ndarray] = {}
         log.info(
             "Loaded ACT policy from %s (chunk=%d, executing %d, observing every %s)",
             policy_path, self.chunk_size, self.n_action_steps, self.observe_every or "replan",
@@ -163,24 +170,42 @@ class ACTRunner:
         m = fmap.float().norm(dim=0).cpu().numpy()
         return normalize_map(m, self.overhead_size_wh), "resnet_layer4_activation"
 
-    def _predict(self, state: np.ndarray, images: dict[str, np.ndarray]) -> np.ndarray:
+    def _forward(self, state: np.ndarray, images: dict[str, np.ndarray]) -> tuple[np.ndarray, np.ndarray | None, str]:
+        """One forward pass: ``(chunk, saliency, method)``. Hold ``_infer_lock``."""
         batch = self.preprocessor(self._observation(state, images))
         with self.torch.inference_mode():
             chunk = self.policy.predict_action_chunk(batch)  # (1, chunk_size, action_dim), normalised
             chunk = self.postprocessor(chunk)
-        chunk = chunk[0].float().cpu().numpy()
-        self.variance.add(self.step_idx, chunk)
-        return chunk
+        return chunk[0].float().cpu().numpy(), *self._saliency()
+
+    def attend(self, state: np.ndarray, frame_bgr: np.ndarray) -> tuple[np.ndarray | None, str, np.ndarray]:
+        """Observe only: saliency and predicted chunk for ``frame_bgr`` as the overhead view at joint state
+        ``state``. Other cameras get their latest live frames (black if the policy hasn't run yet)."""
+        cam = self.overhead_key.removeprefix("observation.images.")
+        images = dict(self._last_images)
+        images[cam] = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        for key in self.image_keys:
+            other = key.removeprefix("observation.images.")
+            if other not in images:
+                _, h, w = self.input_shapes[key]
+                images[other] = np.zeros((h, w, 3), np.uint8)
+        with self._infer_lock:
+            chunk, saliency, method = self._forward(np.asarray(state, np.float32), images)
+        return saliency, method, chunk
 
     def step(self, state: np.ndarray, images: dict[str, np.ndarray]) -> PolicyStep:
         saliency, method, replanned = None, "", False
+        self._last_images = images
         if not self.queue:
-            self.queue.extend(self._predict(state, images)[: self.n_action_steps])
-            saliency, method = self._saliency()
+            with self._infer_lock:
+                chunk, saliency, method = self._forward(state, images)
+            self.variance.add(self.step_idx, chunk)
+            self.queue.extend(chunk[: self.n_action_steps])
             replanned = True
         elif self.observe_every and self.step_idx % self.observe_every == 0:
-            self._predict(state, images)  # observe only: the executing chunk is left untouched
-            saliency, method = self._saliency()
+            with self._infer_lock:  # observe only: the executing chunk is left untouched
+                chunk, saliency, method = self._forward(state, images)
+            self.variance.add(self.step_idx, chunk)
         action = self.queue.popleft()
         var = self.variance.variance(self.step_idx)
         self.step_idx += 1
@@ -272,6 +297,19 @@ class MockPolicy:
             replanned=replanned,
         )
 
+    def attend(self, state: np.ndarray, frame_bgr: np.ndarray) -> tuple[np.ndarray, str, np.ndarray | None]:
+        """Observe only: where the reach would head for this frame (saliency-weighted blob mean)."""
+        sal = red_saliency(frame_bgr)
+        blobs = self._blobs(sal)
+        if not blobs:
+            return sal, "mock_colour_saliency", None
+        weights = np.array([w for _, w in blobs])
+        goal = np.average([b for b, _ in blobs], axis=0, weights=weights) + self.grasp_offset_mm
+        xy = self._plan_chunk(np.array(self.kin.fk(state)), goal, self.n_action_steps * 3)
+        pan_lift_elbow = [self.kin.ik(*p) for p in xy]
+        chunk = np.array([[*j, *np.asarray(state, np.float64)[3:]] for j in pan_lift_elbow])
+        return sal, "mock_colour_saliency", chunk
+
     def _goal(self, sal, gripper_xy, world) -> tuple[np.ndarray, list[np.ndarray]]:
         if self.phase == "REACH":
             blobs = self._blobs(sal)
@@ -348,6 +386,12 @@ class CameraObserver:
         residual = log_amp - cv2.blur(log_amp, (3, 3))
         sal = np.abs(np.fft.ifft2(np.exp(residual + 1j * np.angle(spec)))) ** 2
         return cv2.GaussianBlur(sal.astype(np.float32), (0, 0), 2.5)
+
+    def attend(self, state: np.ndarray, frame_bgr: np.ndarray) -> tuple[np.ndarray, str, None]:
+        rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        sal = self._spectral_residual(rgb)
+        sal = cv2.resize(sal / max(float(sal.max()), 1e-8), (rgb.shape[1], rgb.shape[0]), interpolation=cv2.INTER_LINEAR)
+        return sal, self.METHOD, None
 
     def step(self, state: np.ndarray, images: dict[str, np.ndarray]) -> PolicyStep:
         self._n += 1

@@ -1,44 +1,68 @@
-# 08 · Live demo runbook (about 4 minutes)
+# 08 · Live demo runbook (about 5 minutes)
 
-A rehearsed path through the console that shows every model doing its job. Each beat lists what
-to click, what the audience sees, and one line to say.
+**The story:** a robot policy fails, and the cause is perception, not decision-making. GlassBox shows
+*what it was looking at*, *what in the scene threw it off*, has Muse Wonder explain it, and fixes it
+without retraining when no human is needed.
+
+The demo uses the real SO-101, the ACT checkpoint in `models/last/pretrained_model`, the red cube, the
+green hex tile and a **red mini pocket book** (the distractor).
 
 ## Before you go on stage
 
 - [ ] `MODEL_API_KEY` is in `.env` and the server log shows no `401`.
-- [ ] **Warm the cache.** Run each scenario once (Scenario dropdown, then wait for the diagnosis).
-      If the venue Wi-Fi drops, the same requests replay from `.cache/meta_api/` with a blue
-      `cache` chip instead of failing.
-- [ ] `scripts/start_mock.sh attention_hijack` is running, and the console is open at
-      http://localhost:8000 in a full-screen browser.
-- [ ] Optional real-desk segment: a second server is running with
-      `PORT=8001 scripts/start_webcam.sh 2`, open in another tab.
-- [ ] The microphone permission is granted for the page (click the mic once).
-- [ ] The explainer video ([09](09-video.md)) is ready offline as a backup.
+- [ ] Calibrate once: the homography and an **empty-table background plate**
+      (`python -m backend.robot.calibration --camera 2 ...`). Erasing the book then shows the real
+      empty table instead of an inpainted smear, and the staged book is erased cleanly from where it lies.
+- [ ] Check the masks: `scripts/start_webcam.sh 2` with the cube, tile and book on the table. SAM 3.1 must
+      label the book `distractor`, the cube `target` and the tile `goal`.
+- [ ] `scripts/start_demo.sh` is running, and http://localhost:8000 is open in a full-screen browser.
+      Wait until the inspector chip reads **SAM 3: ready** (the first load downloads ~3.5 GB; `.venv-sam3`
+      must exist, see [06 §5](06-running.md)). The arm
+      stays on **READY** until you press **▶ Start policy**, so nothing moves while it loads.
+- [ ] **Rehearse twice, end to end.** This warms the Meta API cache (`.cache/meta_api/`): if the venue
+      network drops, the same requests replay with a blue `cache` chip. It also leaves saved runs in
+      `runs/` as a fallback.
+- [ ] Arm at rest, cube on its usual start spot (the policy is overfit to it), book somewhere on the
+      table but **not** on the tile.
+- [ ] Backup: the video ([09](09-video.md)), and `http://localhost:8000/#replay` with the best rehearsal
+      run selected in the dropdown.
 
 ## The run
 
 | # | Do | They see | Say |
 |---|---|---|---|
-| 1 | Scenario → `nominal` | The arm picks the red cube and places it on the green hex tile. A heatmap shows where the policy looks | "A $250 arm running an imitation-learned policy. It works until it doesn't, and when it fails you get no explanation." |
-| 2 | Scenario → `attention_hijack` | The arm drifts towards a red ball. The `A(i)` bar for the ball crosses the 0.45 line, the arm freezes in **HOLD**, and *analysis started* appears | "GlassBox reads the policy's own attention every tick. SAM 3.1 turns the scene into named objects, so we can measure that 58 % of its attention is on the ball and 35 % on the cube." |
-| 3 | Wait about 8 s | Spark's diagnosis appears: **ATTENTION_HIJACK**, culprit #1, 0.92, with the root cause citing the numbers and green `meta-api` chips with latencies | "Muse Spark sees the heatmap and the numbers, rules out a stall and glare, and returns a structured fix: erase mask #1." |
-| 4 | Point to the counterfactual panel | Muse Image's version of the scene without the ball | "Muse Image shows the scene the policy *should* have seen." |
-| 5 | Hold the mic and ask: *"Why did the robot stop instead of picking up the cube?"* | The transcript streams in, then a Spark answer that quotes A = 0.58 vs 0.35 | "Hands-free, through Muse Voice Transcribe, with answers grounded in the same evidence." |
-| 6 | **1-Click Apply Muse Fix** | Switch to the *policy* view: the ball is gone from the robot's input, the attention returns to the cube, and the arm completes the task | "We don't retrain anything. We edit what the policy sees, live, at 30 Hz, and SAM keeps the mask locked on." |
-| 7 | Scenario → `servo_stall` | The gripper jams on a box. Joint error and load spike on the scrubber, then HOLD | "A different failure. This time the physics is the problem." |
-| 8 | Wait for the diagnosis | **SERVO_STALL_COLLISION** with a waypoint plan from the local planner, marked *validated*. Muse Wonder's plan replaces it when it arrives | "Muse Wonder gets the kinematics, 10 s of servo telemetry and the control-loop source that will execute its plan. Every waypoint is forward-simulated against the obstacle before it can run." |
-| 9 | Apply the fix | The ghost path is drawn, the arm backs off, routes around the box and hands control back. The cube lands on the green hex tile | "Recovered, not restarted." |
-| 10 | Click the telemetry scrubber at the spike | The console rewinds to the frame of the collision, with its heatmap | "Every second of the last ten is replayable." |
-| 11 | *(optional)* The webcam tab, then **Analyze** | A real desk and the real SO-101, with SAM masks and Spark's reading of the scene | "Same pipeline, on my actual workstation." |
-| 12 | Say *"emergency stop"* | E-STOP, torque off | "And safety always wins." |
+| 1 | *(book off the table)* **↺ Reset**, wait for **READY** (pre-flight done, SAM 3 `ready`), then **▶ Start policy** | ACT picks the cube and places it on the tile. The live heatmap is ACT's own attention | "An imitation-learned policy, trained on a few dozen demos. It works until it doesn't, and when it fails it doesn't tell you why." |
+| 2 | Put the cube back, put the book anywhere on the table, **↺ Reset**, then **▶ Start policy** once the staging badge shows | A "PRE-FLIGHT: SAM 3.1 is scanning the scene" badge, then a magenta **DEMO STAGING** badge and **READY** | Be upfront: "This policy only fails on cue when the book is on the tile, so for the demo GlassBox shows it the book on the tile. That's labelled, and the raw camera is always one click away." |
+| 3 | Watch | The arm heads off course and the attention pulls onto the book. Then **HOLD** and *analysis started* | "GlassBox reads the policy's attention every tick. When it drifts somewhere the demos never looked, it stops the arm." |
+| 4 | — | The console switches to **Failure replay** by itself and plays the last seconds at 0.5×, starting with ACT's map | "Now we take our time. The run was recorded, and we replay it offline with models too heavy to run live on this laptop." |
+| 5 | Point at the progress bar and map buttons | SAM masks appear, then **SAM 3 · 'red cube'** keyframes arrive (failure frame first, then coarse to fine) | "SAM 3 is a much larger perception model, running locally. We ask it where 'the red cube' is in the exact frames our policy saw, and it finds it on the book about as much as on the cube: the scene really is ambiguous. That's not the policy's attention; that's ACT's map, one click over." |
+| 6 | Drag the timeline playhead to the red ◀ HIJACK moment | The book's share crosses the cube's; the mask tag reads `distractor 41% ◀ HIJACK` | "Here's the moment. Attention leaves the cube and lands on the book. The model thinks it sees the goal where the book is." |
+| 7 | Point at the breakdown card | Muse Wonder's verdict: the stage strip **PERCEPTION ✕ → decision, actuation not reached**, culprit, confidence, timeline | "Muse Wonder gets the filmstrip, every attention curve and the servo telemetry, and says where the failure started. Perception, not decision." |
+| 8 | — | Green **✓ Self-corrected, no human needed**. The arm resumes with the book erased from its input and completes the task | "No retraining. GlassBox edits what the policy sees, live, and the policy does what it was trained to do." |
+| 9 | Click **Raw camera** in the replay, then Live → Policy/Raw | The real table vs what the policy saw | "Everything we changed in its input is visible and auditable." |
+| 10 | *(optional)* Put a hand over the cube mid-run | HOLD, and the breakdown says **✋ Needs a human**: "Move your hand out of the workspace" | "And when the fix isn't something software should do, it says so." |
+| 11 | Say *"emergency stop"* or click **E-STOP** | Torque off | "Safety always wins." |
+
+**Timing.** ACT's map is ready within seconds. Each SAM 3 keyframe takes about 25 s on CPU, and Wonder
+starts after 3 of them, so the breakdown lands about 90 s after the failure (`LENS=smolvla`: ~6 s per
+keyframe, Wonder after 5, about 40–60 s). Fill the gap with beats 5
+and 6, which is exactly the time to show the replay. With **Self-correct** off (switch in the inspector),
+step 8 becomes an **⚡ Apply self-correction and resume** button, which works well if you want to pause
+for questions.
+
+**Between attempts.** Press E-STOP, move the arm to rest and the cube to its start spot, then
+**↺ Reset**. Reset re-enables torque, clears the interventions and re-runs the pre-flight scan. The arm then
+waits for **▶ Start policy** (`start_demo.sh` launches with `--start-paused`; `AUTOSTART=1` turns it off).
 
 ## If something goes wrong
 
 | Problem | Recovery |
 |---|---|
-| Spark is slow (over 15 s) | Keep talking over the A(i) bars. The diagnosis lands, and the `latency_ms` chip shows why |
-| The API is down | Chips turn `cache` or `local-fallback`. Say so: "this is the offline fallback, same evidence." The fix still works |
-| Wonder is still thinking at step 9 | Apply anyway. The local plan is validated and runs at once |
-| The mic fails | Type the same question in the chat box; it goes through the same command path |
+| No DEMO STAGING badge after Reset | Pre-flight didn't find the book or the tile (the status line says which). Move the book into clearer view and press Reset again, or put the book on the tile physically |
+| The arm succeeds anyway | Put the book physically on the tile, as in the original failure, and Reset. Staging is only the convenience path |
+| No HOLD: the arm keeps going without tripping a trigger | Press **Analyze** (or say "analyze"). With `FORCE_FAILURE=1` (the default) the press counts as the failure: the arm holds, the reasons start with `DEMO: failure triggered by the operator`, and the replay, breakdown and self-correction run as in steps 4–8. If Spark finds no failure on its own, the distractor holding the most attention is diagnosed, and the counterfactual test then checks whether it really steered the policy |
+| The breakdown is slow | Keep scrubbing the replay: ACT's map and the SAM tags tell the story on their own. Chips show each model's latency |
+| Replay stuck at "refining" | Expected while the arm runs (the replay lens yields the CPU). **❚❚ Hold** lets it finish |
+| The API is down | Chips turn `cache` or `local-fallback`. Say so: "this is the offline fallback, same evidence". Self-correction still works |
+| The arm or USB misbehaves | E-STOP, then open `/#replay` and pick a rehearsal run from the dropdown. The whole replay story works from a saved run |
 | Anything else | Play the video ([09](09-video.md)) |

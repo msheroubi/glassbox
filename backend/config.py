@@ -68,7 +68,7 @@ class Settings(BaseSettings):
     # Camera-only (--webcam): stream a USB webcam as the overhead view with no arm; SAM 3.1 / Muse explain the scene.
     camera_only: bool = False
     robot_port: str = "/dev/ttyACM0"
-    robot_id: str = "kenai_follower"
+    robot_id: str = "kowalski_follower"
     serial_baudrate: int = 1_000_000
     # Camera keys must match the keys the ACT policy was trained with (dataset `observation.images.*`).
     overhead_camera_key: str = "scene"
@@ -90,6 +90,10 @@ class Settings(BaseSettings):
     # Re-run the policy every N steps without changing the executing chunk ("observe" passes): refreshes
     # the attention map and gives the overlapping predictions the chunk-variance OOD signal needs. 0 = off.
     policy_observe_every: int = 20
+    # Camera-only: show a pretrained VLA's attention instead of spectral-residual saliency (no arm commands).
+    vla_path: str | None = None  # e.g. lerobot/smolvla_base
+    vla_camera_key: str = "camera1"  # the VLA's name for the overhead camera
+    vla_attention: str = "action"  # "action": action expert -> image; "language": task tokens -> image
     task_description: str = "Pick up the red cube and place it on the green hex tile."
 
     # --- Calibration ----------------------------------------------------------------------------
@@ -99,7 +103,7 @@ class Settings(BaseSettings):
 
     # --- XAI engine -----------------------------------------------------------------------------
     control_hz: float = 30.0
-    ring_buffer_frames: int = 300  # 10 s at 30 Hz; the scrubber can rewind this far
+    ring_buffer_frames: int = 900  # 30 s at 30 Hz (~15 KB a frame): the scrubber and the replay recorder can rewind this far
     sam_clip_frames: int = 90
     joint_error_threshold_deg: float = 12.0
     joint_error_hold_s: float = 0.5
@@ -108,6 +112,8 @@ class Settings(BaseSettings):
     # Attention-deviation trigger: attention compared with the demos' attention at the same arm pose
     # (calibration/attention_reference.npz, built by scripts/build_attention_reference.py).
     attention_reference_path: Path = REPO_ROOT / "calibration" / "attention_reference.npz"
+    # With a reference, the per-object hijack test is A(i) minus the share the demos had there at this pose.
+    attention_hijack_excess_threshold: float = 0.15
     attention_deviation_threshold: float | None = None  # None = the threshold calibrated into the reference file
     attention_deviation_hold_s: float = 1.0  # sustained over two observe passes, so one noisy map can't stop the arm
     stall_progress_s: float = 4.0
@@ -119,11 +125,53 @@ class Settings(BaseSettings):
     concepts: list[SegmentationConcept] = [
         SegmentationConcept(label="gripper", prompt="robotic arm gripper"),
         SegmentationConcept(label="target", prompt="red cube"),
-        SegmentationConcept(label="distractor", prompt="red ball"),
+        SegmentationConcept(label="distractor", prompt="red book", fallback_prompts=["red notebook", "small red book"]),
         SegmentationConcept(label="obstacle", prompt="cardboard box"),
         SegmentationConcept(label="goal", prompt="green hex tile"),
         SegmentationConcept(label="hand", prompt="human hand"),
     ]
+
+    # SAM scores the cube as a "red book" (and the book as a "red cube") almost as confidently as the right
+    # way round, so on the real camera each red object's colour inside its mask also votes for its label.
+    # Median OpenCV 8-bit LAB of the saturated pixels, measured on this rig's overhead camera
+    # (scripts/measure_appearance.py <run> re-measures them, e.g. under a venue's lighting).
+    # GLASSBOX_APPEARANCE_REFS='{}' turns the vote off.
+    appearance_refs: dict[str, list[float]] = {"target": [156.0, 189.0, 155.0], "distractor": [169.0, 182.0, 134.0]}
+
+    # --- Offline replay (the failure, re-analysed with heavier attention models) -----------------
+    replay_enabled: bool = True
+    runs_dir: Path = REPO_ROOT / "runs"
+    replay_window_s: float = 15.0  # seconds of the run before the failure that are replayed
+    replay_tail_s: float = 2.0  # and after it: the arm stopping (recorded while SAM and Spark run)
+    replay_fps: float = 15.0  # frames kept per second of run (playback is interpolated in the browser)
+    replay_sam_keyframes: int = 4  # SAM 3.1 segmentations across the replay (masks for the A(label) curves)
+    replay_vla_path: str | None = None  # e.g. lerobot/smolvla_base: observe-only attention lens for replays
+    replay_vla_hz: float = 1.0  # SmolVLA keyframes per second of run (~6 s each on CPU)
+    replay_coarse_keyframes: int = 5  # Muse Wonder starts once this many SmolVLA keyframes are done
+    # SAM 3 (facebook/sam3, run locally) as the replay lens instead of SmolVLA: where a perception model finds
+    # the target and goal phrases in each keyframe. Not the policy's attention; it shows visual ambiguity.
+    replay_sam3: bool = False
+    sam3_model: str = "facebook/sam3"
+    sam3_python: Path = REPO_ROOT / ".venv-sam3" / "bin" / "python"  # transformers >= 5 lives only there
+    sam3_lens_labels: list[str] = ["target", "goal"]  # concepts whose prompts SAM 3 grounds
+    replay_sam3_hz: float = 0.5  # SAM 3 keyframes per second of run (~20-25 s each on CPU)
+    replay_sam3_coarse_keyframes: int = 3  # Muse Wonder starts once this many SAM 3 keyframes are done
+    replay_primary_map: str = "vla_language"  # the map shown in Wonder's filmstrip (falls back if missing)
+    replay_counterfactual_wait_s: float = 30.0  # Wonder waits this long for the counterfactual test
+    # Self-correction: apply Wonder's intervention automatically when it says no human is needed.
+    self_correct: bool = False
+
+    # --- Demo staging ---------------------------------------------------------------------------
+    # Show the policy the distractor ON the goal tile wherever it really is (the overfit ACT policy then
+    # fails reliably). Configured by a SAM pre-flight scan before each run; labelled in the UI and the replay.
+    demo_distractor_on_goal: bool = False
+    # A manual Analyze (button or voice) with no anomaly on record is treated as a failure: the arm holds and the
+    # run is diagnosed, replayed and self-corrected like a detected one. Labelled "DEMO" in the anomaly reasons.
+    demo_manual_failure: bool = False
+    # Wait in HOLD for the operator's Start (the Resume button) after launch and after each Reset, instead of
+    # running the policy as soon as it is loaded. Lets the cameras, SAM pre-flight and SmolVLA load first.
+    start_paused: bool = False
+    preflight_timeout_s: float = 20.0
 
     # --- Server ---------------------------------------------------------------------------------
     host: str = "0.0.0.0"

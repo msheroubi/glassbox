@@ -1,9 +1,13 @@
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { api, ApiError } from "./api";
+import AttentionTimeline from "./components/AttentionTimeline";
 import MuseXAIInspector, { type ChatMessage } from "./components/MuseXAIInspector";
 import OverheadCanvas from "./components/OverheadCanvas";
+import ReplayBreakdown from "./components/ReplayBreakdown";
+import ReplayPlayer from "./components/ReplayPlayer";
 import TelemetryScrubber from "./components/TelemetryScrubber";
-import type { HistoryPoint, InterventionType } from "./types";
+import { MAP_ORDER, frameAtTime } from "./replayMath";
+import type { HistoryPoint, InterventionType, SavedRun } from "./types";
 import { useTelemetry } from "./useTelemetry";
 import { useVoice, type VoiceReply } from "./useVoice";
 
@@ -11,7 +15,12 @@ let chatSeq = 0;
 
 export default function App() {
   const tel = useTelemetry();
-  const { status, analysis, pushLog, setStatus, upsertAnalysis, setAnalyzing } = tel;
+  const { status, analysis, pushLog, setStatus, upsertAnalysis, setAnalyzing, replay, upsertReplay } = tel;
+  const [tab, setTab] = useState<"live" | "replay">(() => (window.location.hash === "#replay" ? "replay" : "live"));
+  const [replayPos, setReplayPos] = useState(0);
+  const [mapKind, setMapKind] = useState<string | null>(null);
+  const [savedRuns, setSavedRuns] = useState<SavedRun[]>([]);
+  const [applyingReplay, setApplyingReplay] = useState(false);
   const [scrub, setScrub] = useState<{ frames: HistoryPoint[]; pos: number } | null>(null);
   const [applying, setApplying] = useState(false);
   const [asking, setAsking] = useState(false);
@@ -148,6 +157,80 @@ export default function App() {
     }
   }, [analysis, fail, pushLog]);
 
+  // A new failure replay: switch to it and play it from the start.
+  useEffect(() => {
+    if (tel.replayStarted > 0) {
+      setTab("replay");
+      setReplayPos(0);
+    }
+  }, [tel.replayStarted]);
+
+  // Default to the most informative map that has data (SmolVLA when it is the lens, else ACT, else SAM 3).
+  useEffect(() => {
+    if (!replay) return;
+    const have = (k: string | null) => replay.maps.some((m) => m.kind === k && m.keyframes.length > 0);
+    if (!have(mapKind)) {
+      const best = MAP_ORDER.find(have) ?? replay.maps.find((m) => m.keyframes.length)?.kind ?? null;
+      if (best !== mapKind) setMapKind(best);
+    }
+  }, [replay, mapKind]);
+
+  const refreshRuns = useCallback(() => {
+    api
+      .replays()
+      .then((r) => setSavedRuns(r.runs))
+      .catch(() => undefined);
+  }, []);
+  useEffect(() => {
+    if (tab === "replay") refreshRuns();
+  }, [tab, replay?.replay_id, refreshRuns]);
+
+  const openRun = useCallback(
+    async (id: string) => {
+      try {
+        upsertReplay(await api.openReplay(id), true);
+        setReplayPos(0);
+      } catch (e) {
+        fail("Opening the run failed", e);
+      }
+    },
+    [fail, upsertReplay],
+  );
+
+  const onApplyReplay = useCallback(async () => {
+    if (!replay) return;
+    setApplyingReplay(true);
+    try {
+      await api.applyReplayFix(replay.replay_id);
+      setStatus(await api.status());
+    } catch (e) {
+      fail("Self-correction failed", e);
+    } finally {
+      setApplyingReplay(false);
+    }
+  }, [replay, fail, setStatus]);
+
+  const seekTime = useCallback(
+    (t: number) => {
+      if (!replay) return;
+      setTab("replay");
+      setReplayPos(frameAtTime(replay, t));
+    },
+    [replay],
+  );
+
+  const onSelfCorrect = useCallback(
+    async (on: boolean) => {
+      try {
+        setStatus(await api.settings({ self_correct: on }));
+      } catch (e) {
+        fail("Settings failed", e);
+      }
+    },
+    [fail, setStatus],
+  );
+
+  const replayBusy = replay && replay.status !== "done" && replay.status !== "failed";
   const models = status?.models;
   return (
     <div className="app">
@@ -169,24 +252,69 @@ export default function App() {
       </header>
       <main className="split">
         <div className="left">
-          <OverheadCanvas
-            frameRef={tel.frameRef}
-            subscribeFrame={tel.subscribeFrame}
-            setView={tel.setView}
-            status={status}
-            analysis={analysis}
-            scrubIndex={scrub ? scrub.frames[scrub.pos]?.index ?? null : null}
-            connected={tel.connected}
-          />
-          <TelemetryScrubber
-            history={tel.history}
-            anomalies={tel.anomalies}
-            status={status}
-            scrub={scrub}
-            onEnterScrub={enterScrub}
-            onScrubPos={(pos) => setScrub((s) => (s ? { ...s, pos } : s))}
-            onLive={() => setScrub(null)}
-          />
+          <nav className="tabs">
+            <button className={tab === "live" ? "on" : ""} onClick={() => setTab("live")}>
+              <span className={`dot ${status?.state === "RUNNING" ? "run" : ""}`} /> Live
+            </button>
+            <button className={tab === "replay" ? "on" : ""} onClick={() => setTab("replay")} disabled={!status?.replay?.enabled}>
+              ⏪ Failure replay
+              {replayBusy && <span className="spinner tiny" />}
+              {replay?.breakdown && (
+                <span className={`stage-pill ${replay.breakdown.failure_stage.toLowerCase()}`}>
+                  {replay.breakdown.failure_stage}
+                </span>
+              )}
+            </button>
+            <span className="spacer" />
+            <span className="muted small tab-hint">
+              {tab === "live"
+                ? "ACT runs live on the arm; when it fails, the run is saved and replayed offline"
+                : "Space play/pause · ←/→ step · Shift+←/→ keyframes · click the timeline to seek"}
+            </span>
+          </nav>
+          {tab === "replay" ? (
+            <>
+              <ReplayPlayer
+                replay={replay}
+                pos={replayPos}
+                onPos={setReplayPos}
+                mapKind={mapKind}
+                onMapKind={setMapKind}
+                autoplayKey={tel.replayStarted}
+                savedRuns={savedRuns}
+                onOpenRun={openRun}
+                onRefreshRuns={refreshRuns}
+              />
+              <AttentionTimeline
+                replay={replay}
+                mapKind={mapKind}
+                pos={replayPos}
+                onSeek={setReplayPos}
+                culprit={replay?.breakdown?.culprit_label ?? null}
+              />
+            </>
+          ) : (
+            <>
+              <OverheadCanvas
+                frameRef={tel.frameRef}
+                subscribeFrame={tel.subscribeFrame}
+                setView={tel.setView}
+                status={status}
+                analysis={analysis}
+                scrubIndex={scrub ? (scrub.frames[scrub.pos]?.index ?? null) : null}
+                connected={tel.connected}
+              />
+              <TelemetryScrubber
+                history={tel.history}
+                anomalies={tel.anomalies}
+                status={status}
+                scrub={scrub}
+                onEnterScrub={enterScrub}
+                onScrubPos={(pos) => setScrub((s) => (s ? { ...s, pos } : s))}
+                onLive={() => setScrub(null)}
+              />
+            </>
+          )}
         </div>
         <aside className="right">
           <MuseXAIInspector
@@ -205,6 +333,21 @@ export default function App() {
             onReset={onReset}
             onEstop={statusAction("E-stop failed", api.estop)}
             onResume={statusAction("Resume failed", api.resume)}
+            onHold={statusAction("Hold failed", api.hold)}
+            onSelfCorrect={onSelfCorrect}
+            forensicsFirst={tab === "replay"}
+            forensics={
+              replay && (
+                <ReplayBreakdown
+                  replay={replay}
+                  armState={status?.state}
+                  applying={applyingReplay}
+                  onApply={onApplyReplay}
+                  onSeekTime={seekTime}
+                  onHold={statusAction("Hold failed", api.hold)}
+                />
+              )
+            }
             onClearInterventions={statusAction("Clear failed", api.clearInterventions)}
             onRegenerateCounterfactual={onRegen}
             onAsk={onAsk}

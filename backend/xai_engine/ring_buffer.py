@@ -1,5 +1,8 @@
 """Circular buffer of the last N control steps: overhead JPEG, policy saliency and servo telemetry.
 
+When an intervention or demo staging edits the policy's input, the edited frame is kept too
+(``policy_jpeg``), so a replay can show exactly what the policy saw.
+
 Frames are stored JPEG-encoded (the same bytes streamed to the dashboard) and saliency at quarter
 resolution, so 150 steps of 720p video cost ~20 MB instead of ~1 GB.
 """
@@ -28,9 +31,13 @@ class FrameRecord:
     saliency_u8: np.ndarray | None  # (H/4, W/4) uint8
     telemetry: ServoTelemetry
     phase: str = ""
+    policy_jpeg: bytes | None = None  # the policy's input when it differs from the raw frame
 
     def frame_bgr(self) -> np.ndarray:
         return cv2.imdecode(np.frombuffer(self.jpeg, np.uint8), cv2.IMREAD_COLOR)
+
+    def policy_frame_bgr(self) -> np.ndarray:
+        return cv2.imdecode(np.frombuffer(self.policy_jpeg or self.jpeg, np.uint8), cv2.IMREAD_COLOR)
 
     def saliency(self, size_wh: tuple[int, int]) -> np.ndarray | None:
         if self.saliency_u8 is None:
@@ -52,9 +59,12 @@ class RingBuffer:
         self._lock = threading.Lock()
         self._next_index = 0
 
-    def push(self, timestamp: float, jpeg: bytes, saliency: np.ndarray | None, telemetry: ServoTelemetry, phase: str = "") -> FrameRecord:
+    def push(
+        self, timestamp: float, jpeg: bytes, saliency: np.ndarray | None, telemetry: ServoTelemetry, phase: str = "",
+        policy_jpeg: bytes | None = None,
+    ) -> FrameRecord:
         with self._lock:
-            rec = FrameRecord(self._next_index, timestamp, jpeg, pack_saliency(saliency), telemetry, phase)
+            rec = FrameRecord(self._next_index, timestamp, jpeg, pack_saliency(saliency), telemetry, phase, policy_jpeg)
             self._buf.append(rec)
             self._next_index += 1
             return rec

@@ -7,6 +7,10 @@
 * ``WaypointExecutor`` - plays back a joint-space bypass trajectory (from Muse Wonder or the local
   planner) with limit clamping and a velocity cap, then hands control back to the policy.
 * ``GraspOffset`` - shifts the grasp target by (dx, dy) mm.
+
+``DistractorStager`` is not an intervention but demo staging, and it is labelled as such everywhere it
+shows up: it moves a distractor onto the goal in the *policy's* input to reproduce, on demand, a failure
+the real policy shows when the distractor physically sits there.
 """
 
 from __future__ import annotations
@@ -99,6 +103,98 @@ class MaskSuppressor:
             return cv2.resize(painted, (frame.shape[1], frame.shape[0]), interpolation=cv2.INTER_LINEAR)
         except cv2.error:
             return np.full_like(frame, self.tabletop_bgr)
+
+
+class DistractorStager:
+    """DEMO STAGING: show the policy the distractor sitting on the goal, wherever it really is.
+
+    The ACT policy fails when the red book lies on the green tile. To make that failure reproducible
+    for the demo, the book's pixels are cut from the pre-flight frame, erased from where the book really
+    is (the same fill mask suppression uses) and pasted, feathered, onto the goal. Wherever the live
+    frame no longer matches the pre-flight frame at the goal (the arm passing over it) the paste is
+    skipped, so the arm still occludes the staged book. Suppressing the distractor turns the paste off:
+    the book then disappears from the policy's view entirely.
+    """
+
+    OCCLUSION_DIFF = 40  # mean abs BGR difference that counts as something in front of the staged book
+
+    def __init__(self, background_plate: np.ndarray | None, tabletop_bgr: tuple[int, int, int]) -> None:
+        self._eraser = MaskSuppressor(background_plate, tabletop_bgr, dilate_px=10)
+        self._lock = threading.Lock()
+        self._patch: np.ndarray | None = None  # BGR crop of the distractor
+        self._alpha: np.ndarray | None = None  # (h, w, 1) feathered mask of the crop
+        self._goal_ref: np.ndarray | None = None  # pre-flight pixels under the paste, for occlusion
+        self._dst: tuple[slice, slice] | None = None
+        self.label = ""
+        self.suppressed = False
+        self.src_bbox: list[int] = []
+        self.dst_bbox: list[int] = []
+
+    @property
+    def active(self) -> bool:
+        return self._patch is not None
+
+    @property
+    def pasting(self) -> bool:
+        return self.active and not self.suppressed
+
+    def configure(self, frame: np.ndarray, distractor: np.ndarray, goal_center_uv: tuple[float, float], label: str) -> None:
+        h, w = distractor.shape
+        ys, xs = np.nonzero(distractor)
+        x0, x1, y0, y1 = xs.min(), xs.max() + 1, ys.min(), ys.max() + 1
+        pad = 6
+        x0, y0, x1, y1 = max(0, x0 - pad), max(0, y0 - pad), min(w, x1 + pad), min(h, y1 + pad)
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        crop_mask = cv2.dilate(distractor[y0:y1, x0:x1].astype(np.uint8), k).astype(np.float32)
+        alpha = cv2.GaussianBlur(crop_mask, (0, 0), 1.5)[..., None]
+        ph, pw = y1 - y0, x1 - x0
+        u, v = goal_center_uv
+        dx0 = int(np.clip(round(u - pw / 2), 0, w - pw))
+        dy0 = int(np.clip(round(v - ph / 2), 0, h - ph))
+        dst = (slice(dy0, dy0 + ph), slice(dx0, dx0 + pw))
+        with self._lock:
+            self._eraser.clear()
+            self._eraser.set_mask(0, distractor, label)
+            self._patch = frame[y0:y1, x0:x1].copy()
+            self._alpha = alpha
+            self._goal_ref = frame[dst].astype(np.int16)
+            self._dst = dst
+            self.label, self.suppressed = label, False
+            self.src_bbox = [int(x0), int(y0), int(x1), int(y1)]
+            self.dst_bbox = [int(v) for v in (dx0, dy0, dx0 + pw, dy0 + ph)]
+        log.info("Demo staging: %s at %s shown to the policy at %s", label, self.src_bbox, self.dst_bbox)
+
+    def suppress(self) -> None:
+        with self._lock:
+            self.suppressed = True
+
+    def clear(self) -> None:
+        with self._lock:
+            self._eraser.clear()
+            self._patch = self._alpha = self._goal_ref = self._dst = None
+            self.label, self.suppressed, self.src_bbox, self.dst_bbox = "", False, [], []
+
+    def apply(self, frame_bgr: np.ndarray) -> np.ndarray:
+        with self._lock:
+            if self._patch is None:
+                return frame_bgr
+            out = self._eraser.apply(frame_bgr)
+            if out is frame_bgr:
+                out = frame_bgr.copy()
+            if self.suppressed:
+                return out
+            dst, patch, alpha, ref = self._dst, self._patch, self._alpha, self._goal_ref
+        live = frame_bgr[dst]
+        diff = np.abs(live.astype(np.int16) - ref).mean(axis=2).astype(np.float32)
+        occluded = cv2.GaussianBlur(diff, (0, 0), 3) > self.OCCLUSION_DIFF
+        a = alpha * (~occluded)[..., None]
+        out[dst] = (out[dst].astype(np.float32) * (1 - a) + patch.astype(np.float32) * a).astype(np.uint8)
+        return out
+
+    def info(self) -> dict | None:
+        if not self.active:
+            return None
+        return {"label": self.label, "suppressed": self.suppressed, "from_bbox": self.src_bbox, "to_bbox": self.dst_bbox}
 
 
 def clamp_joints(q: np.ndarray) -> np.ndarray:

@@ -4,10 +4,10 @@ Voice: the browser streams 16 kHz mono PCM16 to ``/ws/voice``; ``VoiceRelay`` fo
 ``wss://api.meta.ai/v1/asr/realtime`` (handshake -> binary audio -> ``endStream``) and yields
 transcript events back. Push-to-talk mode, with robot vocabulary passed as keywords.
 
-Image: ``POST /v1/images/edits`` with the anomaly frame and a "what if the culprit were gone"
-instruction, so the operator can see the scene the policy *should* have seen. Offline fallback:
-the culprit mask is filled with the calibrated background plate (the same operation the live mask
-suppression performs) and the planned recovery path is drawn as a ghost overlay.
+Image: ``POST /v1/images/edits`` renders the scene the policy *should* have seen, guided by SAM's mask
+(see ``backend.xai_engine.counterfactual``): the culprit's region is erased locally first, Muse only
+cleans the patch up, and its pixels are composited back inside that region alone. Offline fallback:
+the local erase (background plate, or inpainting).
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ import cv2
 import numpy as np
 
 from backend.config import Settings
-from backend.schemas import XAIDiagnosisResponse
+from backend.xai_engine import counterfactual as cf
 from backend.xai_engine.visualize import data_url, draw_path
 
 from .base import MetaAPIError, MetaClient
@@ -98,21 +98,27 @@ def image_region(bbox: list[int], frame_wh: tuple[int, int]) -> str:
 
 
 def counterfactual_prompt(
-    diag: XAIDiagnosisResponse, culprit: str | None, where: str | None = None, target: str = "red cube"
+    failure_type: str, culprit: str | None, where: str | None = None, target: str = "red cube",
+    erased: bool = False,
 ) -> str | None:
-    """``culprit`` is the SAM noun phrase of the culprit mask, ``where`` its image region."""
+    """``culprit`` is the SAM noun phrase of the culprit mask, ``where`` its image region. ``erased``: the culprit
+    was already filled in locally, so Muse only has to turn the smudge into clean table (asking it to "remove"
+    an object it can't see makes it invent one)."""
     keep = (f"Keep the {target}, the robot arm, the camera viewpoint, lighting, table texture and every other "
             "object exactly unchanged.")
     at = f" in the {where} of the image" if where else ""
-    if diag.failure_type == "ATTENTION_HIJACK":
-        return f"Remove only the {culprit or 'distracting object'}{at} from the table, showing bare table where it was. {keep}"
-    if diag.failure_type == "OCCLUSION_OOD":
+    if failure_type in ("ATTENTION_HIJACK", "SERVO_STALL_COLLISION"):
+        if erased:
+            return (f"Clean up the blurry smudged patch on the table{at} so it looks like plain, bare tabletop matching "
+                    "the surrounding surface, lighting and texture. Do not add any object there. Keep everything "
+                    "else in the image exactly unchanged.")
+        default = "distracting object" if failure_type == "ATTENTION_HIJACK" else "obstacle"
+        return f"Remove only the {culprit or default}{at} from the table, showing bare table where it was. {keep}"
+    if failure_type == "OCCLUSION_OOD":
         return f"Remove the human hand and arm from the scene so the {target} underneath is fully visible. {keep}"
-    if diag.failure_type == "SPECULAR_GLARE":
+    if failure_type == "SPECULAR_GLARE":
         return (f"Remove the white specular glare from the {target} so the whole cube is evenly lit, matte red. "
                 "Keep the robot arm, camera viewpoint, table and every other object exactly unchanged.")
-    if diag.failure_type == "SERVO_STALL_COLLISION":
-        return f"Remove only the {culprit or 'obstacle'}{at} from the table, showing bare table where it was. {keep}"
     return None
 
 
@@ -125,16 +131,23 @@ class CounterfactualRenderer:
         self,
         frame_bgr: np.ndarray,
         prompt: str,
-        culprit_mask: np.ndarray | None,
+        region: np.ndarray | None,
         background_plate: np.ndarray | None,
-        path_px: list[tuple[float, float]] | None = None,
+        culprit_mask: np.ndarray | None = None,
+        pre_erase: bool = False,
     ) -> tuple[np.ndarray, str]:
-        """Returns ``(image_bgr, source)``. Never raises."""
+        """Returns ``(image_bgr, source)``, the clean counterfactual frame. Never raises.
+
+        ``region``: the only pixels the edit may change. Muse's output is composited back inside it, so the
+        rest is the original frame; ``None`` accepts the whole edited frame. ``culprit_mask``: what must be
+        gone; a result where it survives is rejected. ``pre_erase``: fill ``region`` locally before Muse sees
+        the frame (an object to remove from bare table), and reject a result with anything but table there."""
+        local = cf.erase_local(frame_bgr, region, background_plate) if pre_erase and region is not None else None
         if self.client.enabled:
             body = {
                 "model": self.s.image_model,
                 "prompt": prompt,
-                "images": [{"image_url": data_url(frame_bgr, 90)}],
+                "images": [{"image_url": data_url(local if local is not None else frame_bgr, 92)}],
                 "n": 1,
                 "response_format": "b64_json",
                 "output_format": "jpeg",
@@ -151,27 +164,27 @@ class CounterfactualRenderer:
                 img = cv2.imdecode(np.frombuffer(raw, np.uint8), cv2.IMREAD_COLOR)
                 if img is None:
                     raise MetaAPIError("Muse Image returned undecodable image data")
-                if img.shape[:2] != frame_bgr.shape[:2]:
-                    img = cv2.resize(img, (frame_bgr.shape[1], frame_bgr.shape[0]), interpolation=cv2.INTER_AREA)
-                return self._annotate(img, path_px, "Muse Image counterfactual"), source
+                img = await asyncio.to_thread(cf.align, img, frame_bgr)
+                if region is not None:
+                    img = cf.composite(frame_bgr, img, region)
+                if culprit_mask is not None and cf.culprit_still_visible(frame_bgr, img, culprit_mask):
+                    raise MetaAPIError("the culprit is still visible in Muse Image's edit")
+                if local is not None and not cf.looks_like_table(img, region):
+                    raise MetaAPIError("Muse Image's edit put something where the culprit was")
+                return img, source
             except Exception as e:  # noqa: BLE001
-                log.warning("Muse Image unavailable (%s); rendering local counterfactual", e)
-        return self._annotate(self._local(frame_bgr, culprit_mask, background_plate), path_px, "local counterfactual"), "local-fallback"
+                log.warning("Muse Image counterfactual unusable (%s); using the local one", e)
+        if local is not None:
+            return local, "local-fallback"
+        if region is not None and culprit_mask is not None:
+            return cf.erase_local(frame_bgr, region, background_plate), "local-fallback"
+        if region is not None:  # glare: inpaint the blown-out pixels on the target
+            return cf.remove_glare(frame_bgr, region), "local-fallback"
+        return frame_bgr.copy(), "local-fallback"
 
     @staticmethod
-    def _local(frame: np.ndarray, mask: np.ndarray | None, plate: np.ndarray | None) -> np.ndarray:
-        if mask is None or not mask.any():
-            return frame.copy()
-        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (25, 25))
-        region = cv2.dilate(mask.astype(np.uint8), k)
-        if plate is not None and plate.shape == frame.shape:
-            alpha = cv2.GaussianBlur(region.astype(np.float32), (0, 0), 4)[..., None]
-            return (frame * (1 - alpha) + plate * alpha).astype(np.uint8)
-        return cv2.inpaint(frame, region, 7, cv2.INPAINT_TELEA)
-
-    @staticmethod
-    def _annotate(img: np.ndarray, path_px, caption: str) -> np.ndarray:
-        out = draw_path(img.copy(), path_px, (80, 255, 80), ghost=True) if path_px else img.copy()
+    def annotate(img: np.ndarray, caption: str, path_px=None, color=(80, 255, 80)) -> np.ndarray:
+        out = draw_path(img.copy(), path_px, color, ghost=True) if path_px else img.copy()
         cv2.rectangle(out, (0, 0), (out.shape[1], 30), (0, 0, 0), -1)
         cv2.putText(out, caption, (10, 21), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2, cv2.LINE_AA)
         return out

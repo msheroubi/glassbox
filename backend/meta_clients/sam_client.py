@@ -28,7 +28,7 @@ from meta_sam_parser import (
 )
 
 from backend.config import SegmentationConcept, Settings
-from backend.xai_engine.attribution import SegmentedObject
+from backend.xai_engine.attribution import SegmentedObject, dedupe_objects
 from backend.xai_engine.visualize import encode_jpeg
 
 from .base import MetaAPIError, MetaClient, user_message
@@ -53,10 +53,14 @@ def _place_mask(rec: SegmentationMaskRecord, frame_hw: tuple[int, int]) -> np.nd
 
 
 class SAMClient:
-    def __init__(self, settings: Settings, client: MetaClient, ground_truth: GroundTruthFn | None = None) -> None:
+    def __init__(
+        self, settings: Settings, client: MetaClient, ground_truth: GroundTruthFn | None = None,
+        appearance_refs: dict[str, list[float]] | None = None,
+    ) -> None:
         self.s = settings
         self.client = client
         self.ground_truth = ground_truth
+        self.appearance_refs = appearance_refs  # colour vote for the cube vs the book (real camera only)
 
     async def _events(self, body: dict, cache_key: str):
         """Stream events live; record the output text so a later identical request can replay offline."""
@@ -144,6 +148,8 @@ class SAMClient:
                             objects.append(
                                 SegmentedObject(len(objects), concept.label, concept.prompt, mask, conf, "sam-3.1")
                             )
+                prompts = {c.label: c.prompt for c in concepts}
+                objects = dedupe_objects(objects, frame_bgr, self.appearance_refs, prompts)
                 source = "meta-api"
             except (MetaAPIError, Exception) as e:  # noqa: BLE001 - demo must never crash on SAM
                 log.warning("SAM 3.1 unavailable (%s); using fallback segmentation", e)
@@ -152,7 +158,7 @@ class SAMClient:
         if self.ground_truth is not None:
             found = {o.label for o in objects}
             for gt in self.ground_truth():
-                if gt.label not in found and gt.mask.any():
+                if gt.label not in found and gt.mask.shape == frame_hw and gt.mask.any():  # not for another camera's frames
                     objects.append(SegmentedObject(len(objects), gt.label, gt.prompt, gt.mask, None, "sim-ground-truth"))
         return objects, source
 

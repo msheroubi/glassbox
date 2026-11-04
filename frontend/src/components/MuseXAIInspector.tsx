@@ -1,5 +1,6 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import type { VoicePhase } from "../useVoice";
+import CounterfactualCard from "./CounterfactualCard";
 import { INTERVENTIONS } from "../types";
 import type { AnalysisResult, InterventionType, LogEntry, ResultSource, RuntimeStatus } from "../types";
 
@@ -26,6 +27,10 @@ interface Props {
   onReset: (scenario?: string) => void;
   onEstop: () => void;
   onResume: () => void;
+  onHold: () => void;
+  onSelfCorrect: (on: boolean) => void;
+  forensics?: ReactNode; // the replay breakdown card
+  forensicsFirst?: boolean;
   onClearInterventions: () => void;
   onRegenerateCounterfactual: () => void;
   onAsk: (q: string) => void;
@@ -111,6 +116,16 @@ export default function MuseXAIInspector(props: Props) {
           <span className={`chip ${status?.meta_api_enabled ? "ok" : "warn"}`}>
             Meta API {status?.meta_api_enabled ? "connected" : "off (local fallbacks)"}
           </span>
+          {status?.replay.enabled && (
+            <span className={`chip ${status.replay.vla === "ready" ? "ok" : status.replay.vla === "error" ? "warn" : ""}`} title={status.replay.vla_path ?? "no replay lens (ACT attention only)"}>
+              {status.replay.lens ?? "Replay lens"}: {status.replay.vla === "loading" ? "loading…" : status.replay.vla}
+            </span>
+          )}
+          {status?.demo_staging_enabled && (
+            <span className="chip staging-chip" title="Demo mode: the distractor is moved onto the goal in the policy's input to force the failure">
+              demo staging{status.staging ? `: ${status.staging.label}${status.staging.suppressed ? " (erased)" : " on goal"}` : status.preflight ? ": scanning" : ": no distractor"}
+            </span>
+          )}
           {status?.recovery_active && <span className="chip cache">recovery executing</span>}
           {status && (status.grasp_offset_mm[0] !== 0 || status.grasp_offset_mm[1] !== 0) && (
             <span className="chip cache">
@@ -139,15 +154,34 @@ export default function MuseXAIInspector(props: Props) {
             </button>
           )}
           <span className="spacer" />
+          {status && !status.camera_only && (
+            <label className="switch" title="When Muse Wonder finds a fix that needs no human, apply it and resume automatically">
+              <input type="checkbox" checked={status.self_correct} onChange={(e) => props.onSelfCorrect(e.target.checked)} />
+              <span className="switch-track" />
+              Self-correct
+            </label>
+          )}
+          {state === "RUNNING" && (
+            <button className="btn" onClick={props.onHold} title="Pause the policy (lets the offline replay refine faster)">
+              ❚❚ Hold
+            </button>
+          )}
           {state === "ESTOP" || state === "HOLD" ? (
-            <button className="btn" onClick={props.onResume}>
-              ▶ Resume policy
+            <button className={`btn ${status?.awaiting_start ? "primary" : ""}`} onClick={props.onResume}>
+              {status?.awaiting_start ? "▶ Start policy" : "▶ Resume policy"}
             </button>
           ) : null}
           <button className="btn danger" onClick={props.onEstop}>
             ■ E-STOP
           </button>
         </div>
+        {status?.awaiting_start && (
+          <p className="muted small">
+            Waiting for you to start the policy. Pre-flight scan: {status.preflight ? "running…" : "done"}
+            {status.replay.enabled && <> · {status.replay.lens ?? "replay lens"}: {status.replay.vla === "loading" ? "loading…" : status.replay.vla}</>}
+            {" "}· Meta API: {status.meta_api_enabled ? "connected" : "off"}
+          </p>
+        )}
         {status?.mock_hardware && scenarios[scenario] && <p className="muted small">{scenarios[scenario]}</p>}
         {!!status?.suppression.length && (
           <div className="row suppress-row">
@@ -167,8 +201,11 @@ export default function MuseXAIInspector(props: Props) {
         )}
       </section>
 
+      {props.forensicsFirst && props.forensics}
+
       {/* ------------------------------------------------------------ analysis trigger + diagnosis */}
       <section className="card">
+        {analysis && <h3>Live triage · Muse Spark</h3>}
         <button className="btn primary big" onClick={props.onAnalyze} disabled={analyzing || !props.connected}>
           {analyzing ? <span className="spinner" /> : "🔍"} {analyzing ? "Analysing with SAM 3.1 + Muse Spark…" : "Trigger Failure Analysis"}
         </button>
@@ -203,7 +240,7 @@ export default function MuseXAIInspector(props: Props) {
               <SourceChip label="SAM 3.1" source={analysis.sam_source} />
               <SourceChip label="Muse Spark" source={analysis.diagnosis_source} />
               {analysis.plan_status !== "not_needed" && <SourceChip label="Muse Wonder" source={analysis.plan_source} />}
-              <SourceChip label="Muse Image" source={analysis.counterfactual_source} />
+              <SourceChip label="Muse Image" source={analysis.counterfactual?.source} />
             </div>
             <div className="meta-line muted small">
               {analysis.trigger} trigger · {fmtTime(analysis.created_at)} · culprit mask{" "}
@@ -226,6 +263,8 @@ export default function MuseXAIInspector(props: Props) {
           </div>
         )}
       </section>
+
+      {!props.forensicsFirst && props.forensics}
 
       {/* ------------------------------------------------------------ fix */}
       {analysis && diag && (
@@ -298,34 +337,21 @@ export default function MuseXAIInspector(props: Props) {
       {/* ------------------------------------------------------------ keyframe + counterfactual */}
       {analysis && (
         <section className="card">
-          <h3>Keyframe and Muse Image counterfactual</h3>
-          <div className="images">
-            <figure>
-              <img src={analysis.keyframe_url} alt="keyframe: raw | SAM masks + saliency" />
-              <figcaption>Anomaly keyframe: raw | SAM 3.1 masks + saliency</figcaption>
-            </figure>
-            <figure>
-              {analysis.counterfactual_url ? (
-                <img src={analysis.counterfactual_url} alt="counterfactual" />
-              ) : (
-                <div className="img-placeholder">
-                  {diag?.culprit_mask_id !== null ? (
-                    <>
-                      <span className="spinner" /> rendering counterfactual…
-                    </>
-                  ) : (
-                    "no culprit object to remove"
-                  )}
-                </div>
-              )}
-              <figcaption>
-                "What if the culprit were not there?"{" "}
-                <button className="link" onClick={props.onRegenerateCounterfactual}>
-                  re-render
-                </button>
-              </figcaption>
-            </figure>
-          </div>
+          <h3>Keyframe and counterfactual</h3>
+          <figure className="keyframe">
+            <img src={analysis.keyframe_url} alt="keyframe: raw | SAM masks + saliency" />
+            <figcaption>Anomaly keyframe: raw | SAM 3.1 masks + saliency</figcaption>
+          </figure>
+          {analysis.counterfactual ? (
+            <CounterfactualCard cf={analysis.counterfactual} onRerender={props.onRegenerateCounterfactual} />
+          ) : (
+            <p className="muted small">
+              No counterfactual: {diag?.culprit_mask_id !== null ? "nothing GlassBox can remove for this failure type" : "no culprit object to remove"}.{" "}
+              <button className="link" onClick={props.onRegenerateCounterfactual}>
+                try again
+              </button>
+            </p>
+          )}
         </section>
       )}
 

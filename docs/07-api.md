@@ -12,13 +12,21 @@ Request and response models are in `backend/schemas.py`, mirrored in `frontend/s
 | GET | `/api/analysis/latest` | | `AnalysisResult` |
 | GET | `/api/analysis/{id}` | | `AnalysisResult` |
 | GET | `/api/analysis/{id}/keyframe.jpg` | | The composite image Spark saw |
-| GET | `/api/analysis/{id}/counterfactual.jpg` | | The Muse Image counterfactual (`404` until ready) |
+| GET | `/api/analysis/{id}/counterfactual.jpg?view=image\|original\|attention_before\|attention_after` | | The counterfactual frame (default), the frame it was made from, or the policy's attention on each, with its predicted reach (`404` until ready) |
 | POST | `/api/analysis/{id}/counterfactual` | | Re-render the counterfactual |
 | POST | `/api/apply_fix` | `{"analysis_id", "intervention_type"?}` | `{ok, intervention_type, message}`. `409` during E-STOP |
 | POST | `/api/clear_interventions` | | Status. Stops suppression, trajectories and grasp offsets |
 | POST | `/api/reset` | `{"scenario"?}` | Status. Restarts the scenario (mock) or clears the session |
 | POST | `/api/estop` | | Status. Torque off |
 | POST | `/api/resume` | | Status. Torque on, policy resumes |
+| POST | `/api/hold` | | Status. Operator pause: the arm holds, and a replay waiting for the CPU finishes its lens pass (SAM 3 or SmolVLA) |
+| POST | `/api/settings` | `{"self_correct"?: bool}` | Status. Toggles automatic self-correction |
+| GET | `/api/replays` | | `{runs: [{run_id, duration_s, staged, ...}], latest_id}`: saved failure runs on disk |
+| GET | `/api/replay/latest` · `/api/replay/{id}` | | `ReplayResult` (below) |
+| POST | `/api/replay/{id}/open` | | `ReplayResult`. Loads a saved run, re-analysing it unless its analysis is cached on disk |
+| GET | `/api/replay/{id}/frame/{i}.jpg?view=policy\|raw` | | Frame *i* as the policy saw it, or the raw camera frame |
+| GET | `/api/replay/{id}/counterfactual.jpg?view=` | | The replay's counterfactual at the failure frame (same views) |
+| POST | `/api/replay/{id}/apply` | | Applies Muse Wonder's fix to the live failure. `409` if it needs a human or the arm has moved on |
 | POST | `/api/ask` | `{"question"}` | `{question, answer, source}`. Muse Spark, grounded in the latest evidence |
 | GET | `/api/buffer` | | Ring-buffer timeline: per-frame `index, t, phase, joint_error, chunk_variance, max_load` |
 | GET | `/api/buffer/{index}.jpg?overlay=true` | | A past frame with its saliency heatmap |
@@ -38,10 +46,49 @@ Request and response models are in `backend/schemas.py`, mirrored in `frontend/s
   "diagnosis_source": "meta-api", "sam_source": "meta-api",
   "plan": null, "plan_source": null, "plan_status": "not_needed",   // WAYPOINT_BYPASS: "pending" -> "ready"
   "plan_path_px": null,
-  "counterfactual_url": "/api/analysis/407ef275/counterfactual.jpg", "counterfactual_source": "meta-api",
+  "counterfactual": {"status": "ready", "failure_type": "ATTENTION_HIJACK", "removed": "the red book",
+                     "culprit_label": "distractor", "source": "meta-api", "frame": null,
+                     "image_url": "/api/analysis/407ef275/counterfactual.jpg", "region_polygons": [...],
+                     "maps": [{"kind": "act", "title": "ACT · ...", "moved": 0.62,
+                               "shares_before": {"distractor": 0.58, "target": 0.35},
+                               "shares_after": {"distractor": 0.0, "target": 0.91},
+                               "near_before": {"distractor": 0.10}, "near_after": {"distractor": 0.07},
+                               "area": {"distractor": 0.068}, "left_from": {"distractor": 0.29},
+                               "arrived_at": {"target": 0.05}, "peak_before": "distractor", "peak_after": null, ...}],
+                     "path_before_px": [[...]], "path_after_px": [[...]], "path_shift_px": 41.0,
+                     "outcome": "confirmed",  // confirmed | implicated | partial | ruled_out
+                     "verdict": "Without the red book, 62% of ACT's attention moves, ..."},
   "keyframe_url": "/api/analysis/407ef275/keyframe.jpg",
   "latency_ms": {"sam": 1759, "spark": 6612, "image": 13314},
   "evidence": { /* the exact JSON Muse Spark was given */ }
+}
+```
+
+## `ReplayResult`
+
+```jsonc
+{
+  "replay_id": "20261104-134836-8a7c", "analysis_id": "407ef275", "trigger": "auto", "task": "...",
+  "created_at": 1793972916.2, "has_policy_view": true,
+  "status": "refining",            // saving -> segmenting -> attention -> breakdown -> refining -> done | failed
+  "progress": 0.62, "progress_text": "SmolVLA keyframe 7/12",
+  "fps": 15.0, "n_frames": 180, "failure_frame": 179,
+  "frames": [{"t": -11.93, "phase": "REACH", "joint_error": 0.4}, ...],      // t relative to the failure
+  "segmentations": [{"frame": 0, "t": -11.93, "objects": [{"label": "distractor", "bbox": [...], "polygons": [...]}]}],
+  "maps": [{"kind": "vla_language", "title": "SmolVLA · task grounding", "grid_w": 64, "grid_h": 36,
+            "expected_keyframes": 12,       // kind: act | sam3_target | sam3_goal (SAM 3 lens) | vla_language | vla_action (SmolVLA lens)
+            "keyframes": [{"frame": 179, "t": 0.0, "grid": "<base64 uint8>", "shares": {"target": 0.18, "distractor": 0.41},
+                           "near": {"target": 0.03, "distractor": 0.10}, "near_lift": {"target": 0.6, "distractor": 1.4}}]}],
+  "events": [{"t": -3.2, "frame": 131, "kind": "attention_shift", "map": "vla_language", "label": "Attention shifts to the distractor", "detail": "..."}],
+  "staging": {"label": "distractor", ...},                                 // null when the run wasn't staged
+  "breakdown": {"failure_stage": "PERCEPTION", "culprit_label": "distractor", "self_correctable": true, "needs_human": false,
+                "intervention_type": "INPAINT_MASK_SUPPRESSION", "intervention_parameters": {"label": "distractor"}, ...},
+  "breakdown_source": "meta-api",
+  "counterfactual": {"status": "ready", "frame": 179, "image_url": "/api/replay/20261104-134836-8a7c/counterfactual.jpg",
+                     "maps": [{"kind": "act", ...}, {"kind": "vla_language", ...}, {"kind": "vla_action", ...}], ...},  // as above
+  "self_correction": "applied",    // off | pending | applied | declined | unavailable
+  "self_correction_note": "Suppressing #2 distractor in the policy's view",
+  "latency_ms": {"sam_ms": 5210, "vla_pass_ms": 41200, "wonder_ms": 18400, "replay_total_ms": 64800}
 }
 ```
 
@@ -70,6 +117,11 @@ there is one. After that it streams:
 | `fix_applied` | `analysis_id`, `intervention_type`, `message` |
 | `state` | `state` (RUNNING, HOLD, ESTOP, COMPLETE) and `status` text |
 | `reset` | Scenario restarted |
+| `staging` | The pre-flight scan armed (or cleared) demo staging (`staging`: `StagingInfo` or null) |
+| `replay_started` | A failed run was recorded and its replay began (`replay`: `ReplayResult`); the console switches to the replay tab |
+| `replay_progress` | `replay_id`, `status`, `progress`, `progress_text` |
+| `replay_update` | New keyframes, the breakdown, or the self-correction outcome (`replay`: `ReplayResult`) |
+| `settings` | `self_correct` toggled |
 
 Client to server: `{"view": "policy"}` (default; the frame the policy sees, with suppression
 applied) or `{"view": "raw"}`.

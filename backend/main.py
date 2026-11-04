@@ -3,11 +3,14 @@
     python -m backend.main --mock-hardware --scenario attention_hijack
     python -m backend.main --policy-path outputs/train/act_so101/checkpoints/last/pretrained_model
     python -m backend.main --webcam 2                       # camera only: overhead USB webcam, no arm
+    python -m backend.main --policy-path models/last/pretrained_model --replay-vla lerobot/smolvla_base \
+        --demo-distractor-on-goal --demo-manual-failure --self-correct --start-paused  # the full demo (see docs/08-demo-runbook.md)
 
 Websockets:
     /ws/telemetry  server -> client: JSON {"type": "frame", ...} immediately followed by one binary
                    JPEG of the overhead view; plus JSON events (anomaly, analysis, analysis_update,
-                   fix_applied, state, reset). client -> server: {"view": "policy" | "raw"}.
+                   fix_applied, state, reset, staging, settings, replay_started, replay_update,
+                   replay_progress). client -> server: {"view": "policy" | "raw"}.
     /ws/voice      client -> server: {"type": "start"}, binary PCM16 16 kHz mono chunks, {"type": "stop"};
                    or {"type": "text", "text": ...} for a typed command.
                    server -> client: {"type": "listening" | "transcript" | "command" | "answer" | "error" | "done", ...};
@@ -32,7 +35,7 @@ from pydantic import BaseModel
 from backend.config import REPO_ROOT, SegmentationConcept, Settings, get_settings
 from backend.control_loop import ConflictError, ControlLoop
 from backend.meta_clients.voice_and_image import VoiceRelay
-from backend.schemas import AnalysisResult, ApplyFixRequest, AskRequest, AskResponse
+from backend.schemas import AnalysisResult, ApplyFixRequest, AskRequest, AskResponse, ReplayResult, SettingsPatch
 from backend.xai_engine.visualize import encode_jpeg, heatmap_overlay
 
 log = logging.getLogger("glassbox")
@@ -99,11 +102,13 @@ def create_app(settings: Settings) -> FastAPI:
         return Response(rec.keyframe_jpeg, media_type="image/jpeg")
 
     @app.get("/api/analysis/{aid}/counterfactual.jpg")
-    def counterfactual(aid: str) -> Response:
+    def counterfactual(aid: str, view: str = "image") -> Response:
+        """``view``: image (the edited frame), original, attention_before or attention_after (heatmap + reach)."""
         rec = runtime.analyses.get(aid)
-        if rec is None or rec.counterfactual_jpeg is None:
+        jpeg = rec.counterfactual_views.get(view) if rec is not None else None
+        if jpeg is None:
             raise HTTPException(404, "No counterfactual for this analysis")
-        return Response(rec.counterfactual_jpeg, media_type="image/jpeg")
+        return Response(jpeg, media_type="image/jpeg", headers={"Cache-Control": "no-store"})
 
     @app.post("/api/analysis/{aid}/counterfactual")
     async def regenerate_counterfactual(aid: str) -> dict:
@@ -134,6 +139,77 @@ def create_app(settings: Settings) -> FastAPI:
         except ValueError as e:
             raise HTTPException(400, str(e)) from e
         return runtime.status()
+
+    @app.post("/api/hold")
+    def hold() -> dict:
+        runtime.hold()
+        return runtime.status()
+
+    @app.post("/api/settings")
+    def update_settings(req: SettingsPatch) -> dict:
+        if req.self_correct is not None:
+            runtime.set_self_correct(req.self_correct)
+        return runtime.status()
+
+    # ------------------------------------------------------------------ offline replays
+    def _replay(rid: str) -> ReplayResult:
+        res = runtime.replay.results.get(rid) if runtime.replay else None
+        if res is None:
+            raise HTTPException(404, "Unknown replay")
+        return res
+
+    @app.get("/api/replays")
+    def replays() -> dict:
+        return {"runs": runtime.list_replays(), "latest_id": runtime.replay.latest_id if runtime.replay else None}
+
+    @app.get("/api/replay/latest", response_model=ReplayResult)
+    def latest_replay() -> ReplayResult:
+        if runtime.replay is None or runtime.replay.latest_id is None:
+            raise HTTPException(404, "No replay yet")
+        return _replay(runtime.replay.latest_id)
+
+    @app.get("/api/replay/{rid}", response_model=ReplayResult)
+    def get_replay(rid: str) -> ReplayResult:
+        return _replay(rid)
+
+    @app.post("/api/replay/{rid}/open", response_model=ReplayResult)
+    async def open_replay(rid: str) -> ReplayResult:
+        """Replay a saved run (analysed again unless its analysis is cached on disk)."""
+        try:
+            return _guard(runtime.replay_saved_run, rid)
+        except KeyError as e:
+            raise HTTPException(404, "Unknown run") from e
+
+    @app.get("/api/replay/{rid}/frame/{i}.jpg")
+    def replay_frame(rid: str, i: int, view: str = "policy") -> Response:
+        run = runtime.replay.get_run(rid) if runtime.replay else None
+        if run is None or not 0 <= i < len(run.frames):
+            raise HTTPException(404, "Unknown frame")
+        f = run.frames[i]
+        jpeg = f.policy_jpeg if view == "policy" and f.policy_jpeg is not None else f.raw_jpeg
+        return Response(jpeg, media_type="image/jpeg", headers={"Cache-Control": "public, max-age=86400, immutable"})
+
+    @app.get("/api/replay/{rid}/counterfactual.jpg")
+    def replay_counterfactual(rid: str, view: str = "image") -> Response:
+        """The failure frame with the suspect removed (``view=image``), as recorded (``original``), or the primary
+        model's attention on the original/edited frame (``attention_before``/``attention_after``)."""
+        if view not in ("image", "original", "attention_before", "attention_after"):
+            raise HTTPException(400, "Unknown view")
+        run = runtime.replay.get_run(rid) if runtime.replay else None
+        path = None if run is None or run.path is None else run.path / (
+            "counterfactual.jpg" if view == "image" else f"counterfactual_{view}.jpg")
+        if path is None or not path.exists():
+            raise HTTPException(404, "No counterfactual for this replay")
+        return Response(path.read_bytes(), media_type="image/jpeg", headers={"Cache-Control": "no-store"})
+
+    @app.post("/api/replay/{rid}/apply")
+    async def apply_replay(rid: str) -> dict:
+        try:
+            return await runtime.apply_replay_fix(_replay(rid))
+        except KeyError as e:
+            raise HTTPException(404, "Unknown analysis") from e
+        except ConflictError as e:
+            raise HTTPException(409, str(e)) from e
 
     @app.post("/api/estop")
     def estop() -> dict:
@@ -193,6 +269,9 @@ def create_app(settings: Settings) -> FastAPI:
         if runtime.latest_analysis_id:
             res = runtime.analyses[runtime.latest_analysis_id].result
             await ws.send_text(json.dumps({"type": "analysis", "result": json.loads(res.model_dump_json())}))
+        if runtime.replay is not None and runtime.replay.latest_id in runtime.replay.results:
+            rep = runtime.replay.results[runtime.replay.latest_id]
+            await ws.send_text(json.dumps({"type": "replay_update", "replay": json.loads(rep.model_dump_json())}))
 
         async def receive() -> None:
             while True:
@@ -354,6 +433,10 @@ def main() -> None:
                         help="real arm: overhead capture size, e.g. 640x360 (must be a size the camera supports and the policy was trained at)")
     parser.add_argument("--wrist-camera", default=None, metavar="INDEX_OR_PATH|none",
                         help="real arm: wrist camera, or 'none' if the policy has no wrist image")
+    parser.add_argument("--vla", default=None, metavar="PATH",
+                        help="camera-only: show this pretrained VLA's attention (e.g. lerobot/smolvla_base); never commands the arm")
+    parser.add_argument("--vla-attention", default=None, choices=["action", "language"],
+                        help="action: action expert -> image (default); language: task tokens -> image")
     parser.add_argument("--concepts", default=None,
                         help='comma-separated SAM 3.1 noun phrases, optionally role=phrase '
                              '(roles: target, gripper, obstacle, goal, hand), e.g. "target=red cube,gripper=robot arm,coffee mug"')
@@ -361,6 +444,20 @@ def main() -> None:
     parser.add_argument("--disable-triggers", default=None, metavar="LIST",
                         help="comma-separated anomaly triggers to turn off: servo,variance,hijack,stall (the arm keeps running)")
     parser.add_argument("--no-auto-analyze", action="store_true", help="detect anomalies but wait for the button")
+    parser.add_argument("--replay-vla", default=None, metavar="PATH",
+                        help="replay failures through this VLA's attention offline (e.g. lerobot/smolvla_base); observe only")
+    parser.add_argument("--replay-sam3", action="store_true",
+                        help="replay failures through SAM 3 (facebook/sam3, local, in .venv-sam3) instead of a VLA: "
+                             "where a perception model finds the target and goal phrases; not the policy's attention")
+    parser.add_argument("--no-replay", action="store_true", help="live triage only: don't replay failed runs")
+    parser.add_argument("--demo-distractor-on-goal", action="store_true",
+                        help="DEMO STAGING: show the policy the distractor on the goal tile wherever it is (labelled in the UI)")
+    parser.add_argument("--start-paused", action="store_true",
+                        help="don't run the policy until the operator presses Start (after launch and after each Reset)")
+    parser.add_argument("--demo-manual-failure", action="store_true",
+                        help="DEMO: a manual Analyze with no anomaly on record is treated as a failure (held, replayed, corrected)")
+    parser.add_argument("--self-correct", action="store_true",
+                        help="apply Muse Wonder's intervention automatically when it says no human is needed")
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args()
 
@@ -374,8 +471,18 @@ def main() -> None:
         "host": args.host,
         "port": args.port,
         "auto_analyze": False if args.no_auto_analyze else None,
+        "replay_vla_path": args.replay_vla,
+        "replay_sam3": args.replay_sam3 or None,
+        "replay_enabled": False if args.no_replay else None,
+        "demo_distractor_on_goal": args.demo_distractor_on_goal or None,
+        "demo_manual_failure": args.demo_manual_failure or None,
+        "start_paused": args.start_paused or None,
+        "self_correct": args.self_correct or None,
     }
     camera = lambda v: int(v) if v.isdigit() else v  # noqa: E731
+    # On real overhead footage SAM 3.1 never matches "robotic arm gripper", and which of "robot arm" /
+    # "robotic arm" finds the SO-101 depends on lighting and pose, so try both.
+    arm = {"prompt": "robot arm", "fallback_prompts": ["robotic arm"]}
     if args.camera:
         overrides["overhead_camera_index"] = camera(args.camera)
     if args.camera_size:
@@ -391,6 +498,11 @@ def main() -> None:
             overrides["wrist_camera_index"] = camera(args.wrist_camera)
     if args.disable_triggers:
         overrides["disabled_triggers"] = [t.strip() for t in args.disable_triggers.split(",") if t.strip()]
+    if args.replay_sam3 and args.replay_vla:
+        parser.error("--replay-sam3 and --replay-vla are alternative replay lenses: pick one")
+    if args.vla and args.webcam is None:
+        parser.error("--vla is observe-only and needs --webcam")
+    overrides["vla_path"], overrides["vla_attention"] = args.vla, args.vla_attention
     if args.webcam is not None:
         overrides["camera_only"] = True
         overrides["overhead_camera_index"] = int(args.webcam) if args.webcam.isdigit() else args.webcam
@@ -398,12 +510,11 @@ def main() -> None:
             f"{args.task or get_settings().task_description} (Camera-only session: GlassBox sees the overhead webcam "
             "but is not connected to the arm, so there is no joint or servo telemetry.)"
         )
-        # On real overhead footage SAM 3.1 never matches "robotic arm gripper", and which of "robot arm" /
-        # "robotic arm" finds the SO-101 depends on lighting and pose, so try both.
-        arm = {"prompt": "robot arm", "fallback_prompts": ["robotic arm"]}
         overrides["concepts"] = [c.model_copy(update=arm) if c.label == "gripper" else c for c in get_settings().concepts]
     elif args.task:
         overrides["task_description"] = args.task
+    if not args.mock_hardware and args.webcam is None:
+        overrides["concepts"] = [c.model_copy(update=arm) if c.label == "gripper" else c for c in get_settings().concepts]
     if args.concepts:
         items = [c.strip() for c in args.concepts.split(",") if c.strip()]
         roles = [c.split("=", 1) if "=" in c else (c, c) for c in items]

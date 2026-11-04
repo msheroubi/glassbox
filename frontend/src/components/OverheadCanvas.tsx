@@ -2,6 +2,17 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { bufferFrameUrl } from "../api";
 import type { LiveFrame } from "../useTelemetry";
 import type { AnalysisResult, FrameMeta, LiveObject, RuntimeStatus, SaliencyGrid } from "../types";
+import {
+  DISTRACTOR_COLOR,
+  HIJACK_COLOR,
+  JET_LUT,
+  LABEL_COLORS,
+  PATH_COLOR,
+  SUPPRESSED_COLOR,
+  decodeB64,
+  drawTag,
+  tracePolygons,
+} from "../viz";
 
 interface Props {
   frameRef: React.MutableRefObject<LiveFrame | null>;
@@ -13,63 +24,9 @@ interface Props {
   connected: boolean;
 }
 
-const LABEL_COLORS: Record<string, string> = {
-  target: "#3ddc84",
-  gripper: "#4aa3ff",
-  hand: "#ffb020",
-  obstacle: "#c58cff",
-  goal: "#28d0c8",
-};
-const HIJACK_COLOR = "#ff4d4d";
-const DISTRACTOR_COLOR = "#ffd166";
-const SUPPRESSED_COLOR = "#ff3df2";
-const PATH_COLOR = "#33e1ff";
-
-// Jet colormap with saliency-dependent alpha, as RGBA bytes for 256 levels.
-const JET_LUT = (() => {
-  const lut = new Uint8ClampedArray(256 * 4);
-  const clamp = (x: number) => Math.max(0, Math.min(1, x));
-  for (let i = 0; i < 256; i++) {
-    const v = i / 255;
-    lut[i * 4] = 255 * clamp(1.5 - Math.abs(4 * v - 3));
-    lut[i * 4 + 1] = 255 * clamp(1.5 - Math.abs(4 * v - 2));
-    lut[i * 4 + 2] = 255 * clamp(1.5 - Math.abs(4 * v - 1));
-    lut[i * 4 + 3] = v < 0.06 ? 0 : 255 * Math.min(0.72, 0.15 + v * 0.9);
-  }
-  return lut;
-})();
-
-function decodeB64(data: string): Uint8Array {
-  const bin = atob(data);
-  const out = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
-  return out;
-}
-
 function objectColor(o: { label: string }, share: number, thr: number): string {
   if (LABEL_COLORS[o.label]) return LABEL_COLORS[o.label];
   return share > thr ? HIJACK_COLOR : DISTRACTOR_COLOR;
-}
-
-function tracePolygons(ctx: CanvasRenderingContext2D, polygons: number[][][]) {
-  ctx.beginPath();
-  for (const poly of polygons) {
-    if (poly.length < 2) continue;
-    ctx.moveTo(poly[0][0], poly[0][1]);
-    for (let i = 1; i < poly.length; i++) ctx.lineTo(poly[i][0], poly[i][1]);
-    ctx.closePath();
-  }
-}
-
-function drawTag(ctx: CanvasRenderingContext2D, text: string, x: number, y: number, color: string, scale: number) {
-  ctx.font = `600 ${Math.round(12 * scale)}px ui-monospace, SFMono-Regular, Menlo, monospace`;
-  const w = ctx.measureText(text).width + 8 * scale;
-  const h = 16 * scale;
-  const ty = Math.max(0, y - h);
-  ctx.fillStyle = "rgba(10, 14, 20, 0.78)";
-  ctx.fillRect(x, ty, w, h);
-  ctx.fillStyle = color;
-  ctx.fillText(text, x + 4 * scale, ty + 12 * scale);
 }
 
 export default function OverheadCanvas({ frameRef, subscribeFrame, setView, status, analysis, scrubIndex, connected }: Props) {
@@ -204,9 +161,11 @@ export default function OverheadCanvas({ frameRef, subscribeFrame, setView, stat
     drawOverlays(ctx, meta, canvas.width);
   }, [drawHeat, drawOverlays, frameRef]);
 
+  const drawRef = useRef(draw);
+  drawRef.current = draw;
   const schedule = useCallback(() => {
-    if (raf.current === null) raf.current = requestAnimationFrame(draw);
-  }, [draw]);
+    if (raf.current === null) raf.current = requestAnimationFrame(() => drawRef.current());
+  }, []);
 
   useEffect(() => {
     let last = 0;
@@ -243,7 +202,7 @@ export default function OverheadCanvas({ frameRef, subscribeFrame, setView, stat
   }, [scrubIndex, showHeat, schedule]);
 
   // Redraw on overlay toggles / new analysis even if the stream is paused.
-  useEffect(() => schedule(), [showMasks, showPath, showHeat, analysis, status?.suppression, schedule]);
+  useEffect(() => schedule(), [showMasks, showPath, showHeat, analysis, status?.suppression, schedule, draw]);
 
   const changeView = (v: "policy" | "raw") => {
     setViewState(v);
@@ -285,7 +244,15 @@ export default function OverheadCanvas({ frameRef, subscribeFrame, setView, stat
         {live && hud?.suppressed && view === "policy" && (
           <div className="stage-badge suppress">Real-time mask suppression active: the policy cannot see the erased object</div>
         )}
-        {status?.state === "HOLD" && <div className="stage-badge hold">HOLD: anomaly detected, policy paused</div>}
+        {status?.staging && view === "policy" && (
+          <div className={`stage-corner staging ${status.staging.suppressed ? "off" : ""}`} title="Demo staging: the distractor is moved onto the goal in the policy's input only. The raw camera shows the real scene.">
+            DEMO STAGING · {status.staging.label} {status.staging.suppressed ? "erased by GlassBox" : "on the goal (policy view)"}
+          </div>
+        )}
+        {status?.preflight && <div className="stage-badge hold">PRE-FLIGHT: SAM 3.1 is scanning the scene</div>}
+        {status?.state === "HOLD" && !status.preflight && (
+          <div className="stage-badge hold">{status.awaiting_start ? "READY: press ▶ Start policy" : "HOLD: policy paused"}</div>
+        )}
         {status?.state === "ESTOP" && <div className="stage-badge estop">E-STOP</div>}
         {status?.state === "COMPLETE" && <div className="stage-badge done">Task complete</div>}
       </div>

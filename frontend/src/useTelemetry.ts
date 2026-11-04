@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, wsUrl } from "./api";
-import type { AnalysisResult, AnomalyEvent, FrameMeta, HistoryPoint, LogEntry, RuntimeStatus } from "./types";
+import type { AnalysisResult, AnomalyEvent, FrameMeta, HistoryPoint, LogEntry, ReplayResult, RuntimeStatus } from "./types";
 
 export interface LiveFrame {
   meta: FrameMeta;
@@ -29,6 +29,9 @@ export function useTelemetry() {
   const [currentId, setCurrentId] = useState<string | null>(null);
   const [analyzing, setAnalyzing] = useState(false);
   const [log, setLog] = useState<LogEntry[]>([]);
+  const [replays, setReplays] = useState<Record<string, ReplayResult>>({});
+  const [replayId, setReplayId] = useState<string | null>(null);
+  const [replayStarted, setReplayStarted] = useState(0); // bumps on every new failure replay
 
   const frameRef = useRef<LiveFrame | null>(null);
   const listeners = useRef(new Set<() => void>());
@@ -47,6 +50,14 @@ export function useTelemetry() {
   const upsertAnalysis = useCallback((r: AnalysisResult, makeCurrent: boolean) => {
     setAnalyses((a) => ({ ...a, [r.analysis_id]: r }));
     if (makeCurrent) setCurrentId(r.analysis_id);
+  }, []);
+
+  const replaysRef = useRef<Record<string, ReplayResult>>({});
+  const upsertReplay = useCallback((r: ReplayResult, makeCurrent: boolean) => {
+    replaysRef.current = { ...replaysRef.current, [r.replay_id]: r };
+    setReplays(replaysRef.current);
+    if (makeCurrent) setReplayId(r.replay_id);
+    else setReplayId((cur) => cur ?? r.replay_id);
   }, []);
 
   const subscribeFrame = useCallback((fn: () => void) => {
@@ -105,6 +116,38 @@ export function useTelemetry() {
         case "fix_applied":
           pushLog("fix", `Fix applied (${msg.intervention_type}): ${msg.message}`);
           break;
+        case "replay_started": {
+          const r = msg.replay as ReplayResult;
+          upsertReplay(r, true);
+          setReplayStarted((n) => n + 1);
+          pushLog("analysis", `Recorded ${r.n_frames} frames (${(r.n_frames / r.fps).toFixed(1)} s); offline replay analysis started`);
+          break;
+        }
+        case "replay_update": {
+          const r = msg.replay as ReplayResult;
+          const prev = replaysRef.current[r.replay_id];
+          upsertReplay(r, false);
+          if (prev && !prev.breakdown && r.breakdown) {
+            pushLog("analysis", `Muse Wonder (${r.breakdown_source}): ${r.breakdown.failure_stage}: ${r.breakdown.headline}`);
+          }
+          if (prev && prev.self_correction !== r.self_correction && r.self_correction !== "off") {
+            pushLog(r.self_correction === "applied" ? "fix" : "info", `Self-correction ${r.self_correction}: ${r.self_correction_note}`);
+          }
+          break;
+        }
+        case "replay_progress": {
+          const r = replaysRef.current[msg.replay_id];
+          if (r) upsertReplay({ ...r, status: msg.status, progress: msg.progress, progress_text: msg.text }, false);
+          break;
+        }
+        case "staging":
+          setStatus((s) => (s ? { ...s, staging: msg.staging } : s));
+          if (msg.staging) pushLog("info", `Demo staging: ${msg.staging.label} moved onto the goal in the policy's view`);
+          break;
+        case "settings":
+          setStatus((s) => (s ? { ...s, self_correct: Boolean(msg.self_correct) } : s));
+          pushLog("info", `Self-correction ${msg.self_correct ? "enabled" : "disabled"}`);
+          break;
         case "reset":
           historyRef.current = [];
           setHistory([]);
@@ -117,7 +160,7 @@ export function useTelemetry() {
           break;
       }
     },
-    [pushLog, upsertAnalysis],
+    [pushLog, upsertAnalysis, upsertReplay],
   );
 
   // Websocket with automatic reconnect.
@@ -248,6 +291,10 @@ export function useTelemetry() {
     frameRef,
     subscribeFrame,
     setView,
+    replays,
+    replay: replayId ? replays[replayId] ?? null : null,
+    upsertReplay,
+    replayStarted,
   };
 }
 
