@@ -1,4 +1,4 @@
-# GlassBox-SO101
+# GlassBox
 
 GlassBox is a diagnostic harness for robot policies, built around **Muse Wonder**, **SAM** and
 **Muse Image**. It diagnoses perceptual failures and explains them. When a policy fails, GlassBox gives
@@ -6,6 +6,8 @@ Muse Wonder the evidence it needs to work out why. It also gives Wonder tools to
 so it can raise its confidence in the diagnosis before it commits to one.
 
 We run it on a LeRobot **SO-101** arm with an ACT pick-and-place policy, filmed by an overhead camera.
+
+Everything was built/trained for this hackathon from scratch.
 
 ## How it works
 
