@@ -184,12 +184,6 @@ h3 {
   border: 1px solid var(--bad);
   color: #ffb3b3;
 }
-.stage-badge.done {
-  top: 12px;
-  background: rgba(61, 220, 132, 0.18);
-  border: 1px solid var(--ok);
-  color: #b4f5cf;
-}
 @keyframes pulse {
   50% {
     opacity: 0.55;
@@ -365,10 +359,6 @@ h3 {
 .s-offline {
   background: rgba(255, 77, 77, 0.2);
   color: var(--bad);
-}
-.s-complete {
-  background: rgba(74, 163, 255, 0.18);
-  color: var(--accent);
 }
 .status-text {
   flex: 1;
@@ -1475,4 +1465,52 @@ table.wp td.note {
 }
 .cf-foot {
   line-height: 1.4;
+}
+
+/* ------------------------------------------------------------------ Wonder's own hypothesis test */
+.hypo-card {
+  margin-top: 10px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  border: 1px solid rgba(74, 163, 255, 0.45);
+  background: linear-gradient(180deg, rgba(74, 163, 255, 0.08), rgba(255, 255, 255, 0.01));
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.hypo-card.running {
+  border-style: dashed;
+}
+.hypo-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 14px;
+}
+.hypo-head b {
+  color: var(--accent);
+}
+.hypo-head .spacer {
+  flex: 1;
+}
+.hypo-steps {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.hypo-steps li {
+  display: grid;
+  grid-template-columns: 120px 1fr;
+  gap: 8px;
+  align-items: baseline;
+}
+.hypo-steps p {
+  margin: 0;
+  font-size: 13px;
+}
+.hypo-card .cf-card {
+  margin-top: 2px;
 }

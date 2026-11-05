@@ -1,7 +1,7 @@
 """SAM 3 (``facebook/sam3``) as a worker process: where the model finds each noun phrase in a frame.
 
 Runs in its own interpreter (``.venv-sam3``: transformers >= 5, which SAM 3 needs, on top of the lerobot
-environment's torch), so the main process keeps the transformers SmolVLA and lerobot were built against.
+environment's torch), so the main process keeps the transformers lerobot was built against.
 Imports nothing from ``backend``.
 
 Protocol, over stdin/stdout: each message is a 4-byte big-endian length and a pickle.
@@ -38,7 +38,6 @@ def _write(stream, obj) -> None:
 
 
 def main() -> None:
-    import numpy as np
     import torch
     from PIL import Image
     from transformers import Sam3Model, Sam3Processor

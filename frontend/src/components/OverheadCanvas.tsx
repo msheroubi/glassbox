@@ -254,7 +254,6 @@ export default function OverheadCanvas({ frameRef, subscribeFrame, setView, stat
           <div className="stage-badge hold">{status.awaiting_start ? "READY: press ▶ Start policy" : "HOLD: policy paused"}</div>
         )}
         {status?.state === "ESTOP" && <div className="stage-badge estop">E-STOP</div>}
-        {status?.state === "COMPLETE" && <div className="stage-badge done">Task complete</div>}
       </div>
       <div className="overhead-legend">
         <span><i style={{ background: LABEL_COLORS.target }} />target</span>

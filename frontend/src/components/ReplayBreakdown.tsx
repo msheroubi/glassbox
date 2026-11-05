@@ -1,4 +1,5 @@
 import CounterfactualCard from "./CounterfactualCard";
+import HypothesisCard from "./HypothesisCard";
 import type { FailureStage, InterventionType, ReplayResult, ResultSource } from "../types";
 
 interface Props {
@@ -96,7 +97,7 @@ export default function ReplayBreakdown({ replay, armState, applying, onApply, o
       {!b && (
         <p className="muted small">
           GlassBox is replaying the {replay.n_frames} recorded frames ({(replay.n_frames / replay.fps).toFixed(1)} s) offline: SAM
-          3.1 segments the scene, ACT's attention (and the observe-only lens's maps) is attributed to every object, then Muse Wonder decides whether the
+          3.1 segments the scene, ACT's attention (and SAM 3's perception maps) is attributed to every object, then Muse Wonder decides whether the
           failure started in perception, decision or actuation.
         </p>
       )}
@@ -147,7 +148,20 @@ export default function ReplayBreakdown({ replay, armState, applying, onApply, o
             </div>
           )}
 
-          <SelfCorrection replay={replay} applying={applying} onApply={onApply} />
+          {replay.hypothesis_check && (
+            <HypothesisCard
+              check={replay.hypothesis_check}
+              finalConfidence={b.confidence}
+              finalCulprit={b.culprit_label}
+              onSeekTime={onSeekTime}
+            />
+          )}
+
+          {replay.hypothesis_check?.status === "running" ? (
+            <p className="muted small">The fix is decided once Muse Wonder has its test result.</p>
+          ) : (
+            <SelfCorrection replay={replay} applying={applying} onApply={onApply} />
+          )}
         </>
       )}
 

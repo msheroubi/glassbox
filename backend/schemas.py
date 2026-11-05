@@ -95,7 +95,7 @@ class SegmentedObjectView(BaseModel):
 class CounterfactualMap(BaseModel):
     """One model's attention on the real frame vs the edited frame, at the same joint state."""
 
-    kind: str  # act | vla_action | vla_language | the live policy's saliency method
+    kind: str  # act: the live policy's saliency method
     title: str
     grid_w: int
     grid_h: int
@@ -197,7 +197,7 @@ class ReplayKeyframe(BaseModel):
 
 
 class ReplayMap(BaseModel):
-    kind: str  # act | vla_language | vla_action (SmolVLA lens) | sam3_target | sam3_goal (SAM 3 lens)
+    kind: str  # act | sam3_target | sam3_goal (SAM 3 lens)
     title: str
     description: str
     grid_w: int
@@ -246,6 +246,25 @@ class FailureBreakdown(BaseModel):
     operator_explanation: str
 
 
+class HypothesisCheck(BaseModel):
+    """Muse Wonder's follow-up: the hypothesis its first reading proposed, the counterfactual GlassBox ran to
+    test it, and what the result did to the breakdown."""
+
+    status: Literal["running", "ready", "failed"] = "running"
+    hypothesis: str
+    prediction: str  # what the test shows if the hypothesis is right
+    remove_label: str  # SAM label of the object removed
+    t: float  # the tested moment, seconds relative to the failure
+    frame: int
+    proposed_by: ResultSource  # meta-api | cache: Wonder; local-fallback: the rule engine
+    first_headline: str
+    first_confidence: float
+    first_culprit: str | None = None
+    counterfactual: Counterfactual | None = None
+    result: Literal["supported", "refuted", "inconclusive"] | None = None
+    result_summary: str = ""
+
+
 class ReplayResult(BaseModel):
     replay_id: str
     analysis_id: str | None  # the live analysis this run belongs to (None for a run loaded from disk)
@@ -269,6 +288,7 @@ class ReplayResult(BaseModel):
     self_correction: Literal["off", "pending", "applied", "declined", "unavailable"] = "off"
     self_correction_note: str = ""
     counterfactual: Counterfactual | None = None
+    hypothesis_check: HypothesisCheck | None = None
     latency_ms: Dict[str, float] = Field(default_factory=dict)
 
 

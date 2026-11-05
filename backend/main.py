@@ -1,10 +1,8 @@
 """GlassBox-SO101 FastAPI server.
 
-    python -m backend.main --mock-hardware --scenario attention_hijack
-    python -m backend.main --policy-path outputs/train/act_so101/checkpoints/last/pretrained_model
-    python -m backend.main --webcam 2                       # camera only: overhead USB webcam, no arm
-    python -m backend.main --policy-path models/last/pretrained_model --replay-vla lerobot/smolvla_base \
-        --demo-distractor-on-goal --demo-manual-failure --self-correct --start-paused  # the full demo (see docs/08-demo-runbook.md)
+    python -m backend.main --policy-path ../models/last2/pretrained_model --robot-port /dev/ttyACM1 --camera 2 \
+        --camera-size 640x360 --wrist-camera none --demo-distractor-on-goal --demo-manual-failure \
+        --self-correct --start-paused       # the demo; scripts/start_demo.sh runs exactly this
 
 Websockets:
     /ws/telemetry  server -> client: JSON {"type": "frame", ...} immediately followed by one binary
@@ -30,9 +28,8 @@ from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
 
-from backend.config import REPO_ROOT, SegmentationConcept, Settings, get_settings
+from backend.config import REPO_ROOT, Settings, get_settings
 from backend.control_loop import ConflictError, ControlLoop
 from backend.meta_clients.voice_and_image import VoiceRelay
 from backend.schemas import AnalysisResult, ApplyFixRequest, AskRequest, AskResponse, ReplayResult, SettingsPatch
@@ -43,18 +40,13 @@ log = logging.getLogger("glassbox")
 FRONTEND_DIST = REPO_ROOT / "frontend" / "dist"
 
 
-class ScenarioRequest(BaseModel):
-    scenario: str | None = None
-
-
 def create_app(settings: Settings) -> FastAPI:
     runtime = ControlLoop(settings)
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
         await runtime.start()
-        log.info("GlassBox-SO101 ready on http://%s:%d (mock=%s, camera_only=%s)", settings.host, settings.port,
-                 settings.mock_hardware, settings.camera_only)
+        log.info("GlassBox-SO101 ready on http://%s:%d", settings.host, settings.port)
         try:
             yield
         finally:
@@ -132,12 +124,8 @@ def create_app(settings: Settings) -> FastAPI:
         return runtime.status()
 
     @app.post("/api/reset")
-    def reset(req: ScenarioRequest | None = None) -> dict:
-        scenario = req.scenario if req else None
-        try:
-            _guard(runtime.reset, scenario)
-        except ValueError as e:
-            raise HTTPException(400, str(e)) from e
+    def reset() -> dict:
+        _guard(runtime.reset)
         return runtime.status()
 
     @app.post("/api/hold")
@@ -200,6 +188,18 @@ def create_app(settings: Settings) -> FastAPI:
             "counterfactual.jpg" if view == "image" else f"counterfactual_{view}.jpg")
         if path is None or not path.exists():
             raise HTTPException(404, "No counterfactual for this replay")
+        return Response(path.read_bytes(), media_type="image/jpeg", headers={"Cache-Control": "no-store"})
+
+    @app.get("/api/replay/{rid}/check.jpg")
+    def replay_check(rid: str, view: str = "image") -> Response:
+        """Muse Wonder's follow-up test: the frame it chose without the object it chose (views as above)."""
+        if view not in ("image", "original", "attention_before", "attention_after"):
+            raise HTTPException(400, "Unknown view")
+        run = runtime.replay.get_run(rid) if runtime.replay else None
+        path = None if run is None or run.path is None else run.path / (
+            "check.jpg" if view == "image" else f"check_{view}.jpg")
+        if path is None or not path.exists():
+            raise HTTPException(404, "No follow-up test for this replay")
         return Response(path.read_bytes(), media_type="image/jpeg", headers={"Cache-Control": "no-store"})
 
     @app.post("/api/replay/{rid}/apply")
@@ -409,7 +409,7 @@ async def voice_command(runtime: ControlLoop, text: str) -> dict:
             return {"type": "command", "text": text, "command": "resume", "message": "Resumed."}
         if t.strip(" .!") in ("reset", "restart", "start over"):
             runtime.reset()
-            return {"type": "command", "text": text, "command": "reset", "message": "Scenario reset."}
+            return {"type": "command", "text": text, "command": "reset", "message": "Reset."}
     except ConflictError as e:
         return {"type": "error", "message": str(e)}
     answer = await runtime.ask(text)
@@ -417,39 +417,19 @@ async def voice_command(runtime: ControlLoop, text: str) -> dict:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="GlassBox-SO101 XAI and failure-recovery server")
-    parser.add_argument("--mock-hardware", action="store_true", help="simulated SO-101 + overhead camera (no hardware)")
-    parser.add_argument("--scenario", default=None, help="mock scenario: nominal | attention_hijack | servo_stall | occlusion | specular_glare")
+    parser = argparse.ArgumentParser(description="GlassBox-SO101 XAI and failure-recovery server "
+                                     "(every other setting: GLASSBOX_* env vars, see backend/config.py)")
     parser.add_argument("--policy-path", default=None, help="trained LeRobot ACT checkpoint (local dir or HF repo id)")
     parser.add_argument("--robot-port", default=None)
     parser.add_argument("--robot-id", default=None)
     parser.add_argument("--host", default=None)
     parser.add_argument("--port", type=int, default=None)
-    parser.add_argument("--webcam", default=None, metavar="INDEX",
-                        help="camera-only mode: use this USB webcam (index or /dev/videoN) as the overhead view, no arm")
     parser.add_argument("--camera", default=None, metavar="INDEX_OR_PATH",
-                        help="real arm: overhead camera, an index or a path such as /dev/video2")
+                        help="overhead camera, an index or a path such as /dev/video2")
     parser.add_argument("--camera-size", default=None, metavar="WxH",
-                        help="real arm: overhead capture size, e.g. 640x360 (must be a size the camera supports and the policy was trained at)")
+                        help="overhead capture size, e.g. 640x360 (must be a size the camera supports and the policy was trained at)")
     parser.add_argument("--wrist-camera", default=None, metavar="INDEX_OR_PATH|none",
-                        help="real arm: wrist camera, or 'none' if the policy has no wrist image")
-    parser.add_argument("--vla", default=None, metavar="PATH",
-                        help="camera-only: show this pretrained VLA's attention (e.g. lerobot/smolvla_base); never commands the arm")
-    parser.add_argument("--vla-attention", default=None, choices=["action", "language"],
-                        help="action: action expert -> image (default); language: task tokens -> image")
-    parser.add_argument("--concepts", default=None,
-                        help='comma-separated SAM 3.1 noun phrases, optionally role=phrase '
-                             '(roles: target, gripper, obstacle, goal, hand), e.g. "target=red cube,gripper=robot arm,coffee mug"')
-    parser.add_argument("--task", default=None, help="task / scene description given to Muse Spark")
-    parser.add_argument("--disable-triggers", default=None, metavar="LIST",
-                        help="comma-separated anomaly triggers to turn off: servo,variance,hijack,stall (the arm keeps running)")
-    parser.add_argument("--no-auto-analyze", action="store_true", help="detect anomalies but wait for the button")
-    parser.add_argument("--replay-vla", default=None, metavar="PATH",
-                        help="replay failures through this VLA's attention offline (e.g. lerobot/smolvla_base); observe only")
-    parser.add_argument("--replay-sam3", action="store_true",
-                        help="replay failures through SAM 3 (facebook/sam3, local, in .venv-sam3) instead of a VLA: "
-                             "where a perception model finds the target and goal phrases; not the policy's attention")
-    parser.add_argument("--no-replay", action="store_true", help="live triage only: don't replay failed runs")
+                        help="wrist camera, or 'none' if the policy has no wrist image")
     parser.add_argument("--demo-distractor-on-goal", action="store_true",
                         help="DEMO STAGING: show the policy the distractor on the goal tile wherever it is (labelled in the UI)")
     parser.add_argument("--start-paused", action="store_true",
@@ -462,27 +442,23 @@ def main() -> None:
     args = parser.parse_args()
 
     logging.basicConfig(level=args.log_level, format="%(asctime)s %(levelname)-7s %(name)s: %(message)s")
+    camera = lambda v: int(v) if v.isdigit() else v  # noqa: E731
+    base = get_settings()
+    # On real overhead footage SAM 3.1 never matches "robotic arm gripper", and which of "robot arm" /
+    # "robotic arm" finds the SO-101 depends on lighting and pose, so try both.
+    arm = {"prompt": "robot arm", "fallback_prompts": ["robotic arm"]}
     overrides = {
-        "mock_hardware": args.mock_hardware or None,
-        "mock_scenario": args.scenario,
         "policy_path": args.policy_path,
         "robot_port": args.robot_port,
         "robot_id": args.robot_id,
         "host": args.host,
         "port": args.port,
-        "auto_analyze": False if args.no_auto_analyze else None,
-        "replay_vla_path": args.replay_vla,
-        "replay_sam3": args.replay_sam3 or None,
-        "replay_enabled": False if args.no_replay else None,
         "demo_distractor_on_goal": args.demo_distractor_on_goal or None,
         "demo_manual_failure": args.demo_manual_failure or None,
         "start_paused": args.start_paused or None,
         "self_correct": args.self_correct or None,
+        "concepts": [c.model_copy(update=arm) if c.label == "gripper" else c for c in base.concepts],
     }
-    camera = lambda v: int(v) if v.isdigit() else v  # noqa: E731
-    # On real overhead footage SAM 3.1 never matches "robotic arm gripper", and which of "robot arm" /
-    # "robotic arm" finds the SO-101 depends on lighting and pose, so try both.
-    arm = {"prompt": "robot arm", "fallback_prompts": ["robotic arm"]}
     if args.camera:
         overrides["overhead_camera_index"] = camera(args.camera)
     if args.camera_size:
@@ -496,30 +472,7 @@ def main() -> None:
             overrides["wrist_camera_key"] = ""
         else:
             overrides["wrist_camera_index"] = camera(args.wrist_camera)
-    if args.disable_triggers:
-        overrides["disabled_triggers"] = [t.strip() for t in args.disable_triggers.split(",") if t.strip()]
-    if args.replay_sam3 and args.replay_vla:
-        parser.error("--replay-sam3 and --replay-vla are alternative replay lenses: pick one")
-    if args.vla and args.webcam is None:
-        parser.error("--vla is observe-only and needs --webcam")
-    overrides["vla_path"], overrides["vla_attention"] = args.vla, args.vla_attention
-    if args.webcam is not None:
-        overrides["camera_only"] = True
-        overrides["overhead_camera_index"] = int(args.webcam) if args.webcam.isdigit() else args.webcam
-        overrides["task_description"] = (
-            f"{args.task or get_settings().task_description} (Camera-only session: GlassBox sees the overhead webcam "
-            "but is not connected to the arm, so there is no joint or servo telemetry.)"
-        )
-        overrides["concepts"] = [c.model_copy(update=arm) if c.label == "gripper" else c for c in get_settings().concepts]
-    elif args.task:
-        overrides["task_description"] = args.task
-    if not args.mock_hardware and args.webcam is None:
-        overrides["concepts"] = [c.model_copy(update=arm) if c.label == "gripper" else c for c in get_settings().concepts]
-    if args.concepts:
-        items = [c.strip() for c in args.concepts.split(",") if c.strip()]
-        roles = [c.split("=", 1) if "=" in c else (c, c) for c in items]
-        overrides["concepts"] = [SegmentationConcept(label=r.strip(), prompt=n.strip()) for r, n in roles]
-    settings = get_settings().model_copy(update={k: v for k, v in overrides.items() if v is not None})
+    settings = base.model_copy(update={k: v for k, v in overrides.items() if v is not None})
 
     import uvicorn
 

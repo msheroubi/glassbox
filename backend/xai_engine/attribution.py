@@ -28,7 +28,7 @@ class SegmentedObject:
     prompt: str
     mask: np.ndarray  # (H, W) bool at overhead resolution
     confidence: float | None = None
-    source: str = "sam-3.1"  # or "sim-ground-truth"
+    source: str = "sam-3.1"
 
     @property
     def bbox(self) -> list[int]:

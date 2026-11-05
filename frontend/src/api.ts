@@ -36,7 +36,7 @@ export const api = {
       intervention_type: override ?? null,
     }),
   clearInterventions: () => request<RuntimeStatus>("POST", "/api/clear_interventions"),
-  reset: (scenario?: string) => request<RuntimeStatus>("POST", "/api/reset", scenario ? { scenario } : undefined),
+  reset: () => request<RuntimeStatus>("POST", "/api/reset"),
   estop: () => request<RuntimeStatus>("POST", "/api/estop"),
   resume: () => request<RuntimeStatus>("POST", "/api/resume"),
   ask: (question: string) => request<AskResponse>("POST", "/api/ask", { question }),

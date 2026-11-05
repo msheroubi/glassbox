@@ -1,12 +1,12 @@
 """SAM 3 as the replay's perception lens: where a promptable segmenter finds the task's noun phrases.
 
 This is not the policy's attention. SAM 3 (``facebook/sam3``) is asked "where is the red cube?" and "where
-is the green hex tile?" in each keyframe the policy saw, and its semantic-segmentation head answers with a
+is the green hex tile?" in the failure keyframe the policy saw, and its semantic-segmentation head answers with a
 per-pixel probability. When the "red cube" map lights up the red book, the scene is visually ambiguous for
 that phrase: evidence for a perception failure, independent of how ACT happened to weigh it.
 
-SAM 3 needs transformers >= 5, while SmolVLA and lerobot are pinned to 4.x, so the model runs in its own
-interpreter (``.venv-sam3``, see docs/06-running.md) as ``backend/robot/sam3_worker.py``, niced so it gives
+SAM 3 needs transformers >= 5, while lerobot is pinned to 4.x, so the model runs in its own
+interpreter (``.venv-sam3``, see the README) as ``backend/robot/sam3_worker.py``, niced so it gives
 way to the control loop. One frame costs ~20-25 s on CPU (the 1008x1008 vision encoder; each phrase adds ~2 s).
 """
 
@@ -38,7 +38,7 @@ class Sam3Observer:
                  threads: int | None = None, timeout_s: float = 600.0) -> None:
         """``prompts``: concept label ("target", "goal") -> noun phrase ("red cube", "green hex tile")."""
         if not Path(python).exists():
-            raise FileNotFoundError(f"SAM 3 interpreter {python} not found (create .venv-sam3, docs/06-running.md)")
+            raise FileNotFoundError(f"SAM 3 interpreter {python} not found (create .venv-sam3, see the README)")
         self.prompts = dict(prompts)
         # kind -> the concept label it grounds: the map should sit on that object's mask.
         self.lens_maps = {f"sam3_{label}": label for label in self.prompts}

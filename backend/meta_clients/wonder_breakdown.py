@@ -11,12 +11,18 @@ the servo telemetry and Spark's triage. It answers three questions:
 * Can GlassBox correct it by itself (an intervention on the policy's input or the trajectory), or does
   it need a human (clear the workspace, retrain)?
 
+Then it tests its own hypothesis: the first reading proposes one more counterfactual of its choosing (remove
+an object at a recorded moment) and what it predicts the test will show. GlassBox runs it (``replay.py``) and
+a second turn (``conclude``) writes the final breakdown with the result as evidence.
+
 If Wonder rejects the image the request is retried text-only; without the API (and no cached response)
-a rule engine over the same evidence produces the breakdown.
+a rule engine over the same evidence produces the breakdown, and proposes and judges the follow-up test.
 """
 
 from __future__ import annotations
 
+import copy
+import dataclasses
 import json
 import logging
 from dataclasses import dataclass, field
@@ -150,6 +156,74 @@ what they are ("the red book", "the red cube") rather than by SAM label, quote t
 and give the timeline 3-6 entries from the earliest relevant moment to the failure. Respond with JSON matching
 the schema."""
 
+FOLLOW_UP_BRIEF = """Before your answer is final you can test your own hypothesis. GlassBox will run ONE more counterfactual
+test of your choosing: remove one object (from follow_up_options.remove) from the policy's frame at one recorded
+moment (from follow_up_options.at_t, seconds relative to the failure: the frames with SAM masks), then ask the
+acting policy again where it looks and reaches at the joint state it had then. In follow_up_check, state the
+hypothesis as a testable claim about the cause and what the test will show if you are right. Choose the test
+that would most change or firm up your conclusion: e.g. a suspect other than the one already tested, or the same
+suspect at the moment the attention shift began, before the arm was off course (a re-plan there means more than
+one from the failure pose). Do not repeat the test already in the evidence (follow_up_options.already_tested).
+{when} Write the rest of the answer as your current best reading: you will revise it with the result."""
+
+FOLLOW_UP_WHEN = {
+    "always": "Always request one.",
+    "auto": "Request one only if the evidence leaves your conclusion uncertain (confidence below 0.8); otherwise "
+            "set follow_up_check to null.",
+}
+
+CONCLUDE = """Your first reading of this failure was:
+{first}
+
+You asked GlassBox to test this hypothesis: {hypothesis}
+You predicted: {prediction}
+GlassBox removed {removed} from the policy's frame at t = {t:+.1f} s and asked the acting policy again, at the joint
+state it had then (same measures as the counterfactual_test in the evidence). Result:
+{result}
+
+Write the final breakdown with this result as evidence: it is causal evidence like the first test, weighed by the
+same rules. Set hypothesis_result to "supported" if the test came out as you predicted, "refuted" if it contradicts
+the hypothesis, "inconclusive" otherwise, and hypothesis_result_summary to one or two plain sentences for the
+operator: what the test showed and what it means for the cause. Put the test in the timeline at its time.
+Respond with JSON matching the schema."""
+
+CHECK_RESULTS = ("supported", "refuted", "inconclusive")
+FINAL_SCHEMA = copy.deepcopy(BREAKDOWN_SCHEMA)
+FINAL_SCHEMA["properties"].update({
+    "hypothesis_result": {"type": "string", "enum": list(CHECK_RESULTS)},
+    "hypothesis_result_summary": {
+        "type": "string", "description": "1-2 sentences: what your test showed and what it means for the cause.",
+    },
+})
+FINAL_SCHEMA["required"] = [*BREAKDOWN_SCHEMA["required"], "hypothesis_result", "hypothesis_result_summary"]
+
+
+def _first_schema(options: dict) -> dict:
+    """The breakdown schema plus Wonder's follow-up request, limited to the tests GlassBox can run."""
+    schema = copy.deepcopy(BREAKDOWN_SCHEMA)
+    schema["properties"]["follow_up_check"] = {
+        "type": ["object", "null"],
+        "properties": {
+            "hypothesis": {"type": "string", "description": "One sentence: the testable claim about the cause."},
+            "prediction": {"type": "string", "description": "One sentence: what the test shows if you are right."},
+            "remove": {"type": "string", "enum": options["remove"]},
+            "at_t": {"type": "number", "enum": options["at_t"]},
+        },
+        "required": ["hypothesis", "prediction", "remove", "at_t"],
+    }
+    schema["required"] = [*schema["required"], "follow_up_check"]
+    return schema
+
+
+@dataclass
+class CheckRequest:
+    """A follow-up counterfactual: remove ``remove`` (SAM label) from the frame at ``at_t`` (s, <= 0)."""
+    hypothesis: str
+    prediction: str
+    remove: str
+    at_t: float
+    source: str  # who proposed it: meta-api | cache | local-fallback
+
 
 @dataclass
 class ReplayEvidence:
@@ -193,28 +267,85 @@ class WonderBreakdown:
         self.s = settings
         self.client = client
 
-    async def breakdown(self, filmstrip_bgr: np.ndarray | None, ev: ReplayEvidence) -> tuple[FailureBreakdown, str]:
-        """Returns ``(breakdown, source)``. Never raises."""
+    async def breakdown(
+        self, filmstrip_bgr: np.ndarray | None, ev: ReplayEvidence, follow_up: str = "off",
+    ) -> tuple[FailureBreakdown, str, CheckRequest | None]:
+        """Returns ``(breakdown, source, follow-up test)``. ``follow_up``: always | auto | off; it needs
+        ``ev.extra["follow_up_options"]`` (what can be removed, and when). Never raises."""
+        opts = ev.extra.get("follow_up_options") if follow_up in FOLLOW_UP_WHEN else None
         fallback = local_breakdown(ev)
+
+        def local() -> tuple[FailureBreakdown, str, CheckRequest | None]:
+            wanted = opts and (follow_up == "always" or fallback.confidence < 0.8)
+            return fallback, "local-fallback", local_follow_up(ev, fallback) if wanted else None
+
         if not self.client.enabled:
-            return fallback, "local-fallback"
+            return local()
+        extra = FOLLOW_UP_BRIEF.format(when=FOLLOW_UP_WHEN[follow_up]) if opts else ""
+        try:
+            raw, source = await self._ask(self._prompt(ev, extra), filmstrip_bgr, "failure_breakdown",
+                                          _first_schema(opts) if opts else BREAKDOWN_SCHEMA)
+            request = raw.pop("follow_up_check", None)
+            result = _consistent(FailureBreakdown.model_validate(raw))
+        except Exception as e:  # noqa: BLE001 - API down or malformed output
+            log.warning("Muse Wonder breakdown unavailable (%s); using the rule-based breakdown", e)
+            return local()
+        req = _check_request(request, opts, source) if opts else None
+        if req is None and opts and follow_up == "always":
+            log.info("Muse Wonder proposed no usable follow-up test (%r); the rule engine picks one", request)
+            req = local_follow_up(ev, result)
+        return result, source, req
+
+    async def conclude(
+        self, filmstrip_bgr: np.ndarray | None, ev: ReplayEvidence, first: FailureBreakdown, first_source: str,
+        req: CheckRequest, check: dict,
+    ) -> tuple[FailureBreakdown, str, str, str]:
+        """The second turn: the final breakdown given the follow-up test's result (``counterfactual_facts``).
+        Returns ``(breakdown, source, supported | refuted | inconclusive, summary)``. Never raises."""
+        if self.client.enabled and first_source != "local-fallback":
+            turn = CONCLUDE.format(
+                first=json.dumps(first.model_dump()), hypothesis=req.hypothesis, prediction=req.prediction,
+                removed=check.get("removed", f"the {req.remove}"), t=req.at_t, result=json.dumps(check),
+            )
+            try:
+                raw, source = await self._ask(self._prompt(ev, "", turn), filmstrip_bgr, "failure_breakdown_final",
+                                              FINAL_SCHEMA)
+                result, summary = raw.pop("hypothesis_result", None), raw.pop("hypothesis_result_summary", "")
+                b = _consistent(FailureBreakdown.model_validate(raw))
+                fallback_result, fallback_summary = _check_result(check)
+                return (b, source, result if result in CHECK_RESULTS else fallback_result,
+                        str(summary).strip() or fallback_summary)
+            except Exception as e:  # noqa: BLE001
+                log.warning("Muse Wonder's second turn failed (%s); judging the test by rule", e)
+        b, result, summary = local_conclusion(ev, first, first_source, req, check)
+        return b, "local-fallback", result, summary
+
+    def _prompt(self, ev: ReplayEvidence, follow_up: str, turn: str = "") -> str:
         maps = "\n".join(f"- {k}: {m['title']}. {m['description']}" for k, m in ev.maps.items())
-        prompt = "\n\n".join([
+        facts = ev.facts()
+        if not follow_up:
+            facts.pop("follow_up_options", None)
+        return "\n\n".join(p for p in [
             BRIEF.format(task=ev.task, maps=maps),
+            follow_up,
             f"Primary map (the heatmap in the filmstrip): {ev.primary_map}.",
-            "Evidence:\n" + json.dumps(ev.facts()),
-        ])
+            "Evidence:\n" + json.dumps(facts),
+            turn,
+        ] if p)
+
+    async def _ask(self, prompt: str, filmstrip_bgr: np.ndarray | None, name: str, schema: dict) -> tuple[dict, str]:
+        """One Responses call with the filmstrip, retried text-only if the image is rejected; the parsed JSON."""
         text_part = {"type": "input_text", "text": prompt}
         attempts = []
         if filmstrip_bgr is not None:
             attempts.append(user_message(text_part, {"type": "input_image", "image_url": data_url(filmstrip_bgr, 85)}))
         attempts.append(user_message(text_part))
-        last: Exception | None = None
+        last: Exception = MetaAPIError("no request made")
         for content in attempts:
             body = {
                 "model": self.s.wonder_model,
                 "input": content,
-                "text": json_schema_format("failure_breakdown", BREAKDOWN_SCHEMA),
+                "text": json_schema_format(name, schema),
                 "reasoning": {"effort": self.s.wonder_reasoning_effort},
             }
             try:
@@ -222,18 +353,30 @@ class WonderBreakdown:
                 raw = _parse_json(output_text(data))
                 raw.setdefault("intervention_parameters", {})
                 raw.setdefault("human_action", "")
-                result = FailureBreakdown.model_validate(raw)
-                return _consistent(result), source
+                return raw, source
             except MetaAPIError as e:
                 last = e
                 if e.status is None or e.status >= 500:  # transport or server error: an image-less retry won't help
                     break
                 log.info("Muse Wonder rejected the request (%s); retrying text-only", e)
-            except Exception as e:  # noqa: BLE001 - malformed output
-                last = e
-                break
-        log.warning("Muse Wonder breakdown unavailable (%s); using the rule-based breakdown", last)
-        return fallback, "local-fallback"
+        raise last
+
+
+def _check_request(raw, opts: dict, source: str) -> CheckRequest | None:
+    """Wonder's follow-up request if GlassBox can run it (and it isn't the test already done)."""
+    if not isinstance(raw, dict) or raw.get("remove") not in opts["remove"]:
+        return None
+    try:
+        at_t = min(opts["at_t"], key=lambda t: abs(t - float(raw["at_t"])))
+    except (KeyError, TypeError, ValueError):
+        return None
+    done = opts.get("already_tested") or {}
+    if (raw["remove"], at_t) == (done.get("remove"), done.get("at_t")):
+        return None
+    hyp, pred = str(raw.get("hypothesis", "")).strip(), str(raw.get("prediction", "")).strip()
+    if not hyp:
+        return None
+    return CheckRequest(hyp, pred, raw["remove"], at_t, source)
 
 
 def _consistent(b: FailureBreakdown) -> FailureBreakdown:
@@ -268,6 +411,84 @@ def _ambiguity(ev: ReplayEvidence, culprit: str) -> str:
         return ""
     return (f" A perception model sees the same ambiguity: {on:.0%} of SAM 3's '{m.get('prompt', 'target')}' map "
             f"lies on the {culprit}, {tgt:.0%} on the target.")
+
+
+def _acting_shares(ev: ReplayEvidence) -> dict[str, float]:
+    """The acting policy's attention per object at the last keyframe (near it when measured)."""
+    m = ev.maps.get("act") or ev.maps.get(ev.primary_map) or {}
+    if m.get("near_series"):
+        return dict(m["near_series"][-1][1])
+    return dict(m["series"][-1][1]) if m.get("series") else {}
+
+
+def local_follow_up(ev: ReplayEvidence, b: FailureBreakdown) -> CheckRequest | None:
+    """The rule engine's follow-up test: if the first test cleared its suspect, the next suspect at the failure;
+    otherwise the suspect at the moment the attention shift began, before the arm was off course."""
+    opts = ev.extra.get("follow_up_options")
+    if not opts or not opts["remove"] or not opts["at_t"]:
+        return None
+    done = opts.get("already_tested") or {}
+    tested = (done.get("remove"), done.get("at_t"))
+    shares = _acting_shares(ev)
+    ranked = sorted(opts["remove"], key=lambda lab: -shares.get(lab, 0.0))
+    fail_t = max(opts["at_t"])
+    if _counterfactual_outcome(ev.extra.get("counterfactual_test")) == "ruled_out":
+        other = next((lab for lab in ranked if lab != done.get("remove")), None)
+        if other is not None:
+            return CheckRequest(
+                f"The {other}, not the {done.get('remove')}, is what drew the policy off course.",
+                f"Removing the {other} at the failure moves the policy's attention away from it or changes its reach.",
+                other, fail_t, "local-fallback",
+            )
+    suspect = next((lab for lab in (b.culprit_label, done.get("remove")) if lab in opts["remove"]), ranked[0])
+    shift = next((e for e in ev.events if e.kind == "attention_shift" and not (e.map or "").startswith("sam3_")), None)
+    earlier = [t for t in opts["at_t"] if t < fail_t - 0.05 and (suspect, t) != tested]
+    if earlier:
+        t = min(earlier, key=lambda x: abs(x - shift.t)) if shift is not None else max(earlier)
+        return CheckRequest(
+            f"The {suspect} was already pulling the policy's attention at t = {t:+.1f} s, before the arm went off course.",
+            f"Removing the {suspect} there releases the attention around it or moves the policy's predicted reach.",
+            suspect, t, "local-fallback",
+        )
+    if (suspect, fail_t) != tested:
+        return CheckRequest(
+            f"The {suspect} is what the policy was reacting to at the failure.",
+            f"Removing the {suspect} moves the policy's attention away from it or changes its reach.",
+            suspect, fail_t, "local-fallback",
+        )
+    return None
+
+
+def _check_result(check: dict) -> tuple[str, str]:
+    """``(supported | refuted | inconclusive, summary)`` of a follow-up test, by the acting policy's outcome."""
+    outcome = _counterfactual_outcome(check)
+    result = {"confirmed": "supported", "implicated": "supported", "ruled_out": "refuted"}.get(outcome or "", "inconclusive")
+    lead = {"supported": "As predicted.", "refuted": "Not as predicted.", "inconclusive": "The test is not decisive."}[result]
+    return result, f"{lead} {check.get('verdict', '')}".strip()
+
+
+def local_conclusion(
+    ev: ReplayEvidence, first: FailureBreakdown, first_source: str, req: CheckRequest, check: dict,
+) -> tuple[FailureBreakdown, str, str]:
+    """The final breakdown by rule: the rule engine re-run with the test as evidence (if it wrote the first
+    reading), or Wonder's first reading with the test added. Confidence follows the result."""
+    result, summary = _check_result(check)
+    if first_source == "local-fallback":
+        extra = {k: v for k, v in ev.extra.items() if k != "follow_up_options"}
+        if result == "supported" and _counterfactual_outcome(extra.get("counterfactual_test")) not in ("confirmed", "implicated"):
+            extra["counterfactual_test"] = check  # the test that implicates the suspect decides
+        b = local_breakdown(dataclasses.replace(ev, extra=extra))
+    else:
+        b = first.model_copy(deep=True)
+    b.timeline = sorted(
+        [*b.timeline, TimelineEntry(t=req.at_t, event=f"Test: the scene without the {req.remove}", evidence=summary)],
+        key=lambda e: e.t,
+    )
+    if result == "supported":
+        b.confidence = min(0.95, b.confidence + 0.1)
+    elif result == "refuted":
+        b.confidence = max(0.3, b.confidence - 0.15)
+    return _consistent(b), result, summary
 
 
 def local_breakdown(ev: ReplayEvidence) -> FailureBreakdown:

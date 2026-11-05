@@ -179,7 +179,6 @@ def local_bypass_plan(
 ) -> RecoveryPlan:
     """Back off from the contact, then route around obstacle corners to a pre-grasp above the target."""
     start_xy = np.array(kin.fk(start_q))
-    nodes = []
     if obstacles:
         nearest = min(obstacles, key=lambda r: r.distance(start_xy))
         closest = np.array([np.clip(start_xy[0], nearest.x0, nearest.x1), np.clip(start_xy[1], nearest.y0, nearest.y1)])

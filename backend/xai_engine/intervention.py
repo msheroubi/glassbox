@@ -197,10 +197,17 @@ class DistractorStager:
         return {"label": self.label, "suppressed": self.suppressed, "from_bbox": self.src_bbox, "to_bbox": self.dst_bbox}
 
 
+_limits = np.array([JOINT_LIMITS[n] for n in JOINT_NAMES], dtype=np.float64)  # (joint, lo/hi)
+
+
+def set_joint_limits(limits: dict[str, tuple[float, float]]) -> None:
+    """Clamp to the connected arm's own range (its calibration) instead of the conservative defaults."""
+    global _limits
+    _limits = np.array([limits[n] for n in JOINT_NAMES], dtype=np.float64)
+
+
 def clamp_joints(q: np.ndarray) -> np.ndarray:
-    lo = np.array([JOINT_LIMITS[n][0] for n in JOINT_NAMES])
-    hi = np.array([JOINT_LIMITS[n][1] for n in JOINT_NAMES])
-    return np.clip(q, lo, hi)
+    return np.clip(q, _limits[:, 0], _limits[:, 1])
 
 
 @dataclass

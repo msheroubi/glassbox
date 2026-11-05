@@ -16,7 +16,7 @@ the distractor and the goal, and the policy is shown the distractor on the goal 
 Both views are recorded, and the UI and the replay label the staging.
 
 Every failure starts a live triage (Muse Spark, seconds) and an offline replay of the run
-(``xai_engine.replay``): heavier attention maps over the recorded frames, then a Muse Wonder breakdown
+(``xai_engine.replay``): SAM 3 perception maps over the recorded frames, then a Muse Wonder breakdown
 that can self-correct the failure when no human is needed.
 """
 
@@ -45,12 +45,9 @@ from backend.meta_clients.voice_and_image import CounterfactualRenderer, counter
 from backend.meta_clients.wonder_breakdown import AUTOMATIC, WonderBreakdown
 from backend.meta_clients.wonder_planner import WonderPlanner
 from backend.robot.calibration import Homography
-from backend.robot.policy_hook import ACTRunner, CameraObserver, MockPolicy, PolicyStep
+from backend.robot.policy_hook import ACTRunner, PolicyStep
 from backend.robot.sam3_observer import Sam3Observer
-from backend.robot.vla_observer import SmolVLAObserver
-from backend.robot.so101_interface import (
-    SCENARIOS, MockSO101, Observation, PlanarKinematics, RealSO101, WebcamSource,
-)
+from backend.robot.so101_interface import Observation, PlanarKinematics, RealSO101
 from backend.schemas import (
     AnalysisResult, AnomalyEvent, AskResponse, Counterfactual, RecoveryPlan, ReplayResult, ServoTelemetry,
 )
@@ -66,7 +63,7 @@ from backend.xai_engine.attribution import (
     saliency_centroid,
 )
 from backend.xai_engine.intervention import (
-    DistractorStager, GraspOffset, MaskSuppressor, WaypointExecutor, clamp_joints,
+    DistractorStager, GraspOffset, MaskSuppressor, WaypointExecutor, clamp_joints, set_joint_limits,
 )
 from backend.xai_engine.replay import LazyModel, ReplayAnalyzer, Run, list_runs
 from backend.xai_engine.ring_buffer import FrameRecord, RingBuffer
@@ -74,7 +71,7 @@ from backend.xai_engine.visualize import composite_keyframe, draw_path, encode_j
 
 log = logging.getLogger(__name__)
 
-RUNNING, HOLD, ESTOP, COMPLETE = "RUNNING", "HOLD", "ESTOP", "COMPLETE"
+RUNNING, HOLD, ESTOP = "RUNNING", "HOLD", "ESTOP"
 START_PROMPT = "ready: press ▶ Start policy"
 LIVE_ATTRIBUTION_EVERY = 3  # ticks: 10 Hz attribution/polygon refresh at 30 Hz control
 
@@ -149,25 +146,19 @@ class ControlLoop:
         self.kin = PlanarKinematics()
         self.size_wh = (s.overhead_width, s.overhead_height)
         self.homography = Homography.load_or_default(s.homography_path, *self.size_wh)
-        self.mock = s.mock_hardware and not s.camera_only
-        self.camera_only = s.camera_only
-        if self.mock:
-            self.robot: MockSO101 | RealSO101 | WebcamSource = MockSO101(s, self.homography, s.mock_scenario)
-            self.plate = self.robot.background_plate()
-        else:
-            self.robot = WebcamSource(s) if self.camera_only else RealSO101(s)
-            self.plate = cv2.imread(str(s.background_plate_path)) if s.background_plate_path.exists() else None
-            if self.plate is not None and self.plate.shape[:2] != self.size_wh[::-1]:
-                self.plate = cv2.resize(self.plate, self.size_wh, interpolation=cv2.INTER_AREA)
-            if self.plate is None:
-                log.warning("No background plate at %s: suppression will inpaint (run calibration.py)", s.background_plate_path)
+        self.robot = RealSO101(s)
+        self.plate = cv2.imread(str(s.background_plate_path)) if s.background_plate_path.exists() else None
+        if self.plate is not None and self.plate.shape[:2] != self.size_wh[::-1]:
+            self.plate = cv2.resize(self.plate, self.size_wh, interpolation=cv2.INTER_AREA)
+        if self.plate is None:
+            log.warning("No background plate at %s: suppression will inpaint (run calibration.py)", s.background_plate_path)
 
-        self.policy: MockPolicy | ACTRunner | CameraObserver | SmolVLAObserver | None = None
+        self.policy: ACTRunner | None = None
         self.policy_kind = "none"
         self.suppressor = MaskSuppressor(self.plate, s.tabletop_bgr)
         self.stager = DistractorStager(self.plate, s.tabletop_bgr)  # demo staging (see module docstring)
         self.self_correct = s.self_correct
-        self._preflight_pending = s.demo_distractor_on_goal and not s.camera_only  # hold until staged
+        self._preflight_pending = s.demo_distractor_on_goal  # hold until staged
         self._preflight_task: asyncio.Task | None = None
         self._run_t0 = 0.0  # timestamp the current run started (after pre-flight): the replay starts here
         self._awaiting_start = False  # --start-paused: HOLD until the operator presses Start
@@ -177,20 +168,20 @@ class ControlLoop:
         self.reference: AttentionReference | None = None
         self.attn_dev: Deviation | None = None
         self.deviation_threshold: float | None = None
-        if s.policy_path and not self.mock and s.attention_reference_path.exists():
+        if s.policy_path and s.attention_reference_path.exists():
             self.reference = AttentionReference.load(s.attention_reference_path)
             self.deviation_threshold = s.attention_deviation_threshold or self.reference.threshold
             if self.deviation_threshold is None:
-                log.warning("%s has no calibrated threshold: run scripts/calibrate_attention_reference.py", s.attention_reference_path)
+                log.warning("%s has no calibrated threshold: set GLASSBOX_ATTENTION_DEVIATION_THRESHOLD", s.attention_reference_path)
                 self.reference = None
             else:
                 log.info("Attention reference: %d demo samples, deviation threshold %.2f", len(self.reference.maps), self.deviation_threshold)
-        elif s.policy_path and not self.mock:
+        elif s.policy_path:
             log.warning("No attention reference at %s: falling back to the fixed A(i) hijack rule", s.attention_reference_path)
         disabled = set(s.disabled_triggers)
         if s.policy_path and s.policy_observe_every > 0:
-            # Disagreement between observe passes fires on normal demonstration runs too (see docs/04), so it
-            # is only a trigger when the policy genuinely replans with overlapping chunks.
+            # Disagreement between observe passes fires on normal demonstration runs too, so it is only a
+            # trigger when the policy genuinely replans with overlapping chunks.
             disabled.add("variance")
         disabled = frozenset(disabled)
         self.detector = AnomalyDetector(
@@ -239,78 +230,54 @@ class ControlLoop:
         self.hub.loop = self.loop
         self._analysis_lock = asyncio.Lock()
         self.meta = MetaClient(self.s)
-        # The colour references describe the real overhead camera, not the simulator's renders.
-        self.sam = SAMClient(self.s, self.meta, self._mock_truth if self.mock else None,
-                             None if self.mock else self.s.appearance_refs)
+        self.sam = SAMClient(self.s, self.meta, self.s.appearance_refs)
         self.spark = SparkExplainer(self.s, self.meta)
         self.wonder = WonderPlanner(self.s, self.meta, self.kin)
         self.images = CounterfactualRenderer(self.s, self.meta)
 
         await asyncio.to_thread(self.robot.connect)
-        if self.camera_only and self.s.vla_path:
-            self.policy = await asyncio.to_thread(
-                SmolVLAObserver, self.s.vla_path, self.s.policy_device, self.s.overhead_camera_key,
-                self.s.vla_camera_key, self.size_wh, self.s.task_description, self.s.vla_attention,
-            )
-            self.policy_kind = "smolvla-observe"
-        elif self.camera_only:
-            self.policy = CameraObserver(self.s.overhead_camera_key)
-            self.policy_kind = "camera-only"
-        elif self.s.policy_path:
+        if (limits := getattr(self.robot, "calibrated_limits", lambda: None)()) is not None:
+            set_joint_limits(limits)
+            log.info("Joint limits from calibration: %s",
+                     ", ".join(f"{n} {lo:.0f}..{hi:.0f}" for n, (lo, hi) in limits.items()))
+        if self.s.policy_path:
             self.policy = await asyncio.to_thread(
                 ACTRunner, self.s.policy_path, self.s.policy_device, self.s.overhead_camera_key, self.size_wh,
                 self.s.policy_n_action_steps, self.s.task_description, self.s.policy_observe_every,
             )
             self.policy_kind = "act"
-        elif self.mock:
-            self.policy = MockPolicy(self.kin, self.homography, n_action_steps=10)
-            self.policy_kind = "mock"
         else:
             log.warning("No --policy-path given: the arm holds position; streaming and analysis still work")
-        self.status_text = (
-            f"camera-only: SmolVLA {self.s.vla_attention} attention, observe only (no arm commands)"
-            if self.policy_kind == "smolvla-observe"
-            else "camera-only: observing the workspace (no arm connected)" if self.camera_only
-            else "running" if self.policy is not None else "no policy loaded: holding position"
-        )
-        if self.s.start_paused and self.policy is not None and not self.camera_only:
+        self.status_text = "running" if self.policy is not None else "no policy loaded: holding position"
+        if self.s.start_paused and self.policy is not None:
             # Nothing is sent to the arm in HOLD, so it stays where it is while everything loads.
             self.state, self._awaiting_start = HOLD, True
             self.status_text = START_PROMPT
         if not self.meta.enabled:
             log.warning("MODEL_API_KEY not set: all Meta models will use local fallbacks")
-        if self.s.replay_enabled and not self.camera_only:
+        if self.s.replay_enabled:
             self.replay = ReplayAnalyzer(
                 self.s, self.sam, WonderBreakdown(self.s, self.meta), self.hub.publish_event,
-                busy=self._replay_should_wait, vla=self._replay_vla(), on_breakdown=self._on_breakdown,
+                busy=self._replay_should_wait, lens=self._replay_lens(), on_breakdown=self._on_breakdown,
                 counterfactual=self.counterfactual, live_attenders=self.attenders,
             )
-        if not self.mock and self.meta.enabled and self.s.live_sam_interval_s > 0:
+        if self.meta.enabled and self.s.live_sam_interval_s > 0:
             self._live_sam_task = asyncio.create_task(self._live_sam_loop())
         self._thread = threading.Thread(target=self._run, name="glassbox-control", daemon=True)
         self._thread.start()
         self._schedule_preflight()
 
-    def _replay_vla(self) -> LazyModel | None:
-        """The replay's observe-only lens, loaded in the background: SAM 3 (perception) or SmolVLA (a second
-        policy's attention). Either only ever looks at recorded frames."""
+    def _replay_lens(self) -> LazyModel | None:
+        """The replay's SAM 3 perception lens, loaded in the background; it only ever looks at recorded frames."""
         s = self.s
-        if s.replay_sam3:
-            prompts = {c.label: c.prompt for c in s.concepts if c.label in s.sam3_lens_labels}
-
-            def load_sam3() -> Sam3Observer:
-                return Sam3Observer(str(s.sam3_python), prompts, s.sam3_model)
-
-            return LazyModel(f"SAM 3 ({s.sam3_model})", load_sam3)
-        path = s.replay_vla_path
-        if not path:
+        if not s.replay_sam3:
             return None
+        prompts = {c.label: c.prompt for c in s.concepts if c.label in s.sam3_lens_labels}
 
-        def load() -> SmolVLAObserver:
-            return SmolVLAObserver(path, s.policy_device, s.overhead_camera_key, s.vla_camera_key, self.size_wh,
-                                   s.task_description, "language")
+        def load_sam3() -> Sam3Observer:
+            return Sam3Observer(str(s.sam3_python), prompts, s.sam3_model)
 
-        return LazyModel(f"SmolVLA ({path})", load)
+        return LazyModel(f"SAM 3 ({s.sam3_model})", load_sam3)
 
     def _replay_should_wait(self) -> bool:
         """The replay lens and the ACT policy share the CPU: don't starve the arm while it moves."""
@@ -329,7 +296,7 @@ class ControlLoop:
         except Exception as e:  # noqa: BLE001
             log.warning("Could not hold robot on shutdown: %s", e)
         await asyncio.to_thread(self.robot.disconnect)
-        lens = self.replay.vla.model if self.replay is not None and self.replay.vla is not None else None
+        lens = self.replay.lens.model if self.replay is not None and self.replay.lens is not None else None
         if isinstance(lens, Sam3Observer):
             lens.close()
         if self.meta is not None:
@@ -355,8 +322,6 @@ class ControlLoop:
             time.sleep(max(0.0, period - (now - t0)))
 
     def _policy_step(self, obs: Observation, policy_frame: np.ndarray) -> PolicyStep:
-        if isinstance(self.policy, MockPolicy):
-            return self.policy.step(obs.qpos.copy(), policy_frame, self.robot)
         images = dict(obs.images_rgb)
         if policy_frame is not obs.overhead_bgr:
             images[self.s.overhead_camera_key] = cv2.cvtColor(policy_frame, cv2.COLOR_BGR2RGB)
@@ -395,10 +360,7 @@ class ControlLoop:
                         self.saliency, self.saliency_method = step.saliency, step.saliency_method
                         if self.reference is not None:
                             self.attn_dev = self.reference.score(obs.qpos, step.saliency)
-                    self.phase = (
-                        self.policy.phase if isinstance(self.policy, MockPolicy)
-                        else "OBSERVE" if self.camera_only else "ACT"
-                    )
+                    self.phase = "ACT"
                 else:
                     target = obs.qpos.copy()
                 target = self.robot.send(clamp_joints(target))
@@ -419,16 +381,10 @@ class ControlLoop:
             if self.tick_count % LIVE_ATTRIBUTION_EVERY == 0:
                 self._refresh_live_attribution()
 
-            # camera-only: there is no arm to fail, so the triggers stay off and analysis is on demand
-            if (self.state == RUNNING and not self.executor.active and self.phase != "DONE" and not self.camera_only
-                    and not self._preflight_pending):
+            if self.state == RUNNING and not self.executor.active and not self._preflight_pending:
                 event = self.detector.update(tel, self.live_attrs)
                 if event is not None:
                     self._on_anomaly(event)
-            if self.mock and self.state == RUNNING and (self.robot.delivered or self.phase == "DONE"):
-                self.state, self.status_text = COMPLETE, "task complete: cube delivered to the green hex tile"
-                self.robot.hold()
-                self.hub.publish_event({"type": "state", "state": self.state, "status": self.status_text})
             state, phase = self.state, self.phase
             suppression = {
                 "active": self.suppressor.active or (self.stager.active and self.stager.suppressed),
@@ -453,7 +409,6 @@ class ControlLoop:
             "state": state,
             "phase": phase,
             "status": self.status_text,
-            "scenario": getattr(self.robot, "scenario", None),
             "fps": round(self.fps, 1),
             "telemetry": tel.model_dump(),
             "saliency": self._saliency_grid(),
@@ -473,39 +428,16 @@ class ControlLoop:
         return {"w": gw, "h": gh, "method": self.saliency_method, "data": base64.b64encode(data).decode()}
 
     def _grasp_offset(self) -> list[float]:
-        if isinstance(self.policy, MockPolicy):
-            return _r(self.policy.grasp_offset_mm, 1)
         return [round(self.grasp.dx_mm, 1), round(self.grasp.dy_mm, 1)]
 
     def _refresh_live_attribution(self) -> None:
-        """Live attention shares for the hijack trigger: simulator masks in mock, last SAM pass on hardware."""
-        if self.mock:
-            objs = [
-                SegmentedObject(i, g.label, g.prompt, g.mask, None, "sim-ground-truth")
-                for i, g in enumerate(self._mock_truth())
-            ]
-        else:
-            objs = self._sam_live_objects
+        """Live attention shares for the hijack trigger, over the last live SAM pass (``live_sam_interval_s``)."""
+        objs = self._sam_live_objects
         self.live_objects = objs
         self.live_attrs = compute_attributions(objs, self.saliency, self.homography, self.attn_dev) if objs and self.saliency is not None else []
         shares = {a.mask_id: a.attention_share for a in self.live_attrs}
         self.live_views = [
             {**o.view().model_dump(), "source": o.source, "attention_share": shares.get(o.mask_id, 0.0)} for o in objs
-        ]
-
-    def _mock_truth(self) -> list:
-        """Simulator masks of the scene the policy sees: under demo staging the distractor sits on the goal."""
-        objs = self.robot.ground_truth_objects()
-        info = self.stager.info()
-        if info is None or info["suppressed"]:
-            return objs
-        dx, dy = info["to_bbox"][0] - info["from_bbox"][0], info["to_bbox"][1] - info["from_bbox"][1]
-        shift = np.float32([[1, 0, dx], [0, 1, dy]])
-        h, w = self.size_wh[1], self.size_wh[0]
-        return [
-            type(o)(o.label, o.prompt, cv2.warpAffine(o.mask.astype(np.uint8), shift, (w, h)).astype(bool))
-            if o.label == info["label"] else o
-            for o in objs
         ]
 
     def _enter_hold(self, reason: str) -> None:
@@ -623,8 +555,7 @@ class ControlLoop:
                     self._enter_hold("analysing")
                 anomaly = anomaly or self.last_anomaly  # a manual press while held still explains the anomaly
                 # Demo: an operator's Analyze with nothing detected is treated as the failure itself.
-                forced = (anomaly is None and trigger != "auto" and self.s.demo_manual_failure and not self.camera_only
-                          and not self._awaiting_start)
+                forced = anomaly is None and trigger != "auto" and self.s.demo_manual_failure and not self._awaiting_start
             self.hub.publish_event({"type": "analysis_started", "trigger": trigger})
             rec = self.ring.latest()
             if rec is None:
@@ -693,7 +624,7 @@ class ControlLoop:
                 rerun = stale and self.state == HOLD and self.last_anomaly is not None and self.s.auto_analyze
             if stale:
                 # The scene was reset mid-analysis: don't offer a fix for a scene that no longer exists.
-                log.info("Discarding analysis %s: the scenario was reset while it ran", aid)
+                log.info("Discarding analysis %s: the scene was reset while it ran", aid)
                 if rerun:  # an anomaly in the new scene was blocked by this analysis; explain that one instead
                     # Starts after this coroutine returns and releases the analysis lock.
                     asyncio.create_task(self.analyze("auto", self.last_anomaly)).add_done_callback(self._log_future_error)
@@ -784,7 +715,7 @@ class ControlLoop:
 
     # ================================================================== demo staging
     def _schedule_preflight(self) -> None:
-        if not self.s.demo_distractor_on_goal or self.camera_only or self.loop is None:
+        if not self.s.demo_distractor_on_goal or self.loop is None:
             return
 
         def go() -> None:
@@ -903,16 +834,7 @@ class ControlLoop:
     # ------------------------------------------------------------------ counterfactuals
     def attenders(self) -> list[tuple[str, str, Callable]]:
         """``(kind, title, attend)`` for the running policy; ``attend(state, frame_bgr) -> (saliency, method, chunk)``."""
-        p = self.policy
-        if isinstance(p, ACTRunner):
-            return [("act", "ACT · live attention", p.attend)]
-        if isinstance(p, MockPolicy):
-            return [("act", "Mock policy · colour attention", p.attend)]
-        if isinstance(p, SmolVLAObserver):
-            return [(f"vla_{p.map_kind}", f"SmolVLA · {p.map_kind} attention", p.attend)]
-        if isinstance(p, CameraObserver):
-            return [("saliency", "Visual saliency · no policy", p.attend)]
-        return []
+        return [("act", "ACT · live attention", self.policy.attend)] if self.policy is not None else []
 
     def _chunk_path_px(self, q0: np.ndarray, chunk: np.ndarray | None, scale: float = 1.0) -> list[list[float]] | None:
         """The gripper path an action chunk predicts, in overhead pixels (from ``q0``), times ``scale``."""
@@ -1057,14 +979,9 @@ class ControlLoop:
             elif itype == "RETRY_GRASP_OFFSET":
                 dx = float(params.get("dx_mm", plan.grasp_offset_mm[0] if plan else 0.0))
                 dy = float(params.get("dy_mm", plan.grasp_offset_mm[1] if plan else 0.0))
-                if isinstance(self.policy, MockPolicy):
-                    self.policy.grasp_offset_mm = np.array([dx, dy])
-                else:
-                    self.grasp.set(dx, dy)
+                self.grasp.set(dx, dy)
                 message = f"Grasp target shifted by ({dx:+.1f}, {dy:+.1f}) mm"
             else:
-                if self.mock and diag.failure_type == "OCCLUSION_OOD":
-                    self.robot.clear_operator_interference()
                 message = "Workspace cleared by operator; resuming policy"
             if self.policy is not None:
                 self.policy.queue.clear()
@@ -1096,7 +1013,7 @@ class ControlLoop:
                     self.suppressor.set_mask(mid, mask, obj.label)
 
     async def _live_sam_loop(self) -> None:
-        """Hardware mode: periodic SAM pass so attention shares (and the hijack trigger) are live.
+        """Periodic SAM pass so attention shares (and the hijack trigger) are live.
 
         Segments what the policy sees (so the shares match its input). With demo staging on and nothing
         staged yet, a distractor that appears mid-run in the raw scene arms the stager."""
@@ -1126,23 +1043,17 @@ class ControlLoop:
             self._tracked.clear()
             self.executor.cancel()
             self.grasp.clear()
-            if isinstance(self.policy, MockPolicy):
-                self.policy.grasp_offset_mm = np.zeros(2)
             self.status_text = "interventions cleared"
         self.hub.publish_event({"type": "state", "state": self.state, "status": self.status_text})
 
-    def reset(self, scenario: str | None = None) -> None:
+    def reset(self) -> None:
         with self._lock:
             self._epoch += 1
-            if self.mock:
-                self.robot.set_scenario(scenario or self.robot.scenario)
-            elif scenario:
-                raise ConflictError("Scenarios only exist in --mock-hardware mode")
             if self.policy is not None:
                 self.policy.reset()
             self.suppressor.clear()
             self.stager.clear()
-            self._preflight_pending = self.s.demo_distractor_on_goal and not self.camera_only
+            self._preflight_pending = self.s.demo_distractor_on_goal
             self._run_t0 = 0.0
             self._tracked.clear()
             self.executor.cancel()
@@ -1155,20 +1066,20 @@ class ControlLoop:
             self.live_objects, self.live_attrs, self.live_views = [], [], []
             if self.state == ESTOP:
                 self.robot.resume_torque()
-            self._awaiting_start = self.s.start_paused and self.policy is not None and not self.camera_only
+            self._awaiting_start = self.s.start_paused and self.policy is not None
             if self._awaiting_start:
                 self.state = HOLD
                 self.robot.hold()
-                self.status_text = f"reset{f' to scenario {scenario}' if scenario else ''}: {START_PROMPT}"
+                self.status_text = f"reset: {START_PROMPT}"
             else:
                 self.state = RUNNING
-                self.status_text = f"reset{f' to scenario {scenario}' if scenario else ''}: policy running"
-        self.hub.publish_event({"type": "reset", "scenario": getattr(self.robot, "scenario", None)})
+                self.status_text = "reset: policy running"
+        self.hub.publish_event({"type": "reset"})
         self.hub.publish_event({"type": "state", "state": self.state, "status": self.status_text})
         self._schedule_preflight()
 
     def hold(self) -> None:
-        """Operator pause: the arm holds position (and a replay paused for the arm resumes its SmolVLA pass)."""
+        """Operator pause: the arm holds position (and a replay paused for the arm resumes its SAM 3 pass)."""
         with self._lock:
             if self.state == RUNNING:
                 self._enter_hold("paused by operator")
@@ -1218,10 +1129,6 @@ class ControlLoop:
                 "state": self.state,
                 "status": self.status_text,
                 "phase": self.phase,
-                "mock_hardware": self.mock,
-                "camera_only": self.camera_only,
-                "scenario": getattr(self.robot, "scenario", None),
-                "scenarios": SCENARIOS if self.mock else {},
                 "policy": self.policy_kind,
                 "saliency_method": self.saliency_method,
                 "meta_api_enabled": bool(self.meta and self.meta.enabled),
@@ -1238,9 +1145,8 @@ class ControlLoop:
                 "replay": {
                     "enabled": self.replay is not None,
                     "latest_id": self.replay.latest_id if self.replay else None,
-                    "vla": self.replay.vla_status() if self.replay else "off",
-                    "vla_path": self.s.sam3_model if self.s.replay_sam3 else self.s.replay_vla_path,
-                    "lens": "SAM 3" if self.s.replay_sam3 else "SmolVLA" if self.s.replay_vla_path else None,
+                    "lens": self.replay.lens_status() if self.replay else "off",
+                    "lens_model": self.s.sam3_model if self.s.replay_sam3 else None,
                 },
                 "recovery_active": self.executor.active,
                 "grasp_offset_mm": self._grasp_offset(),

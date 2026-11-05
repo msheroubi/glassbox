@@ -1,8 +1,8 @@
 // Keyframe interpolation and lookups shared by the replay player, the timeline and the breakdown card.
 import type { ReplayKeyframe, ReplayMap, ReplayResult, ReplaySegmentation } from "./types";
 
-// The policy that ran comes before SAM 3's perception maps; SmolVLA (when it is the lens) before both.
-export const MAP_ORDER = ["vla_language", "vla_action", "act", "sam3_target", "sam3_goal"];
+// The policy that ran comes before SAM 3's perception maps.
+export const MAP_ORDER = ["act", "sam3_target", "sam3_goal"];
 
 /** The concept a SAM 3 perception map is prompted with ("target", "goal"), or null for attention maps. */
 export function groundedLabel(kind: string | null | undefined): string | null {
@@ -68,11 +68,5 @@ export function nearestSegmentation(segs: ReplaySegmentation[], frame: number): 
 
 export function mapLabel(kind: string, title?: string): string {
   if (groundedLabel(kind)) return title ?? `SAM 3 · ${groundedLabel(kind)}`;
-  return kind === "vla_language"
-    ? "SmolVLA · grounding"
-    : kind === "vla_action"
-      ? "SmolVLA · action"
-      : kind === "act"
-        ? "ACT · live"
-        : kind;
+  return kind === "act" ? "ACT · live" : kind;
 }

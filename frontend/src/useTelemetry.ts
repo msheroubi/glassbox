@@ -154,7 +154,7 @@ export function useTelemetry() {
           setAnomalies([]);
           setCurrentId(null);
           setStatus((s) => (s ? { ...s, latest_analysis_id: null } : s));
-          pushLog("info", `Scenario reset${msg.scenario ? `: ${msg.scenario}` : ""}`);
+          pushLog("info", "Reset");
           break;
         default:
           break;
@@ -248,7 +248,6 @@ export function useTelemetry() {
                 status: meta.status,
                 phase: meta.phase,
                 fps: meta.fps,
-                scenario: meta.scenario,
                 grasp_offset_mm: meta.grasp_offset_mm,
                 suppression: meta.suppression.objects,
                 recovery_active: meta.recovery.active,

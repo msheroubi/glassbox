@@ -1,4 +1,4 @@
-"""Record a failed run and replay it offline through heavier attention models.
+"""Record a failed run and replay it offline through a heavier perception model.
 
 The live loop can only afford ACT's own attention. When a run fails, the last seconds of the ring
 buffer become a ``Run``: the frames the policy actually saw (after any staging or suppression), the
@@ -9,21 +9,19 @@ it can be replayed again later, e.g. as a fallback during a demo.
 
 1. SAM 3.1 segments a few keyframes of the policy's view.
 2. ACT's recorded attention becomes a map track (5 Hz).
-3. An observe-only lens runs on the recorded frames (it never drives the arm), either
-   - SAM 3 (``--replay-sam3``, ``facebook/sam3`` locally): where a perception model finds the target's and
-     the goal's phrases. Not attention: a map that puts "red cube" on the red book shows visual ambiguity; or
-   - SmolVLA (``--replay-vla``), with the real joint states: one pass gives two maps, its action expert's
-     attention and the task text's grounding.
-   The failure frame goes first, then a coarse sweep, then the gaps are filled, so the replay sharpens
-   progressively and the breakdown doesn't wait for the fine pass.
+3. SAM 3 (``facebook/sam3``, run locally) looks at the failure keyframe as an observe-only lens: where a
+   perception model finds the target's and the goal's phrases. Not attention: a map that puts "red cube" on
+   the red book shows visual ambiguity. It runs alongside the breakdown, which doesn't wait for it.
 4. A(label)(t), the attention share of each SAM label over time, and the first attention shift
    (a distractor holding more attention than the target; for SAM 3, more of the phrase's map than the
    object it names) are computed for every map.
 5. Counterfactual test on the failure frame (concurrently with 3): Muse Image removes the suspect inside its
-   SAM region, and the policy that ran (and SmolVLA, if it is the lens) are asked where they would look
-   (and reach) without it.
+   SAM region, and the policy that ran is asked where it would look (and reach) without it.
 6. Muse Wonder writes the forensic breakdown, with the counterfactual as evidence, and decides whether
    GlassBox can correct the failure by itself or a human is needed.
+7. Wonder tests its own hypothesis: its first reading names one more counterfactual (an object to remove at a
+   segmented moment, e.g. the next suspect, or the same one when the attention shift began), GlassBox runs it,
+   and a second Wonder turn writes the final breakdown with the result.
 
 Progress is published as websocket events; the browser plays the run back at full frame rate and
 interpolates the heatmaps between keyframes.
@@ -35,11 +33,10 @@ import asyncio
 import base64
 import json
 import logging
-import shutil
 import threading
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
@@ -48,31 +45,21 @@ import numpy as np
 
 from backend.config import Settings
 from backend.meta_clients.sam_client import SAMClient
-from backend.meta_clients.wonder_breakdown import ReplayEvidence, WonderBreakdown
+from backend.meta_clients.wonder_breakdown import CheckRequest, ReplayEvidence, WonderBreakdown
 from backend.schemas import (
-    Counterfactual, ReplayEvent, ReplayFrameInfo, ReplayKeyframe, ReplayMap, ReplayResult, ReplaySegmentation,
+    Counterfactual, HypothesisCheck, ReplayEvent, ReplayFrameInfo, ReplayKeyframe, ReplayMap, ReplayResult, ReplaySegmentation,
 )
 from backend.xai_engine import counterfactual as cfx
 from backend.xai_engine.attribution import (
     NEAR_DRAW_LIFT, NON_DISTRACTOR_LABELS, Neighbourhoods, SegmentedObject, grid_b64 as _grid_b64, label_shares,
     near_shares, neighbourhoods,
 )
-from backend.xai_engine.ring_buffer import SALIENCY_DOWNSCALE, FrameRecord
-from backend.xai_engine.visualize import draw_objects, encode_jpeg, heatmap_overlay
+from backend.xai_engine.ring_buffer import FrameRecord
+from backend.xai_engine.visualize import draw_objects, heatmap_overlay
 
 log = logging.getLogger(__name__)
 
 MAP_INFO = {
-    "vla_language": (
-        "SmolVLA · task grounding",
-        "Where a pretrained vision-language-action model (SmolVLA, observe only, not the policy that ran) grounds "
-        "the task's words in the frames the policy saw: which pixels read as 'the red cube' and 'the green tile'.",
-    ),
-    "vla_action": (
-        "SmolVLA · action attention",
-        "Where SmolVLA's action expert looks while predicting the next actions from these frames and joint "
-        "states: a second, larger policy's view of what matters for acting.",
-    ),
     "act": (
         "ACT · live attention",
         "The attention of the ACT policy that actually drove the arm (decoder cross-attention over the camera "
@@ -252,21 +239,6 @@ class LazyModel:
 
 
 # ====================================================================================== analysis helpers
-def _bisect_order(n: int) -> list[int]:
-    """0..n-1 ordered so every prefix is spread as evenly as possible."""
-    if n <= 0:
-        return []
-    order, seen = [], set()
-    step = 1 << max(0, (n - 1).bit_length())
-    while step >= 1:
-        for i in range(0, n, step):
-            if i not in seen:
-                seen.add(i)
-                order.append(i)
-        step //= 2
-    return order
-
-
 def attention_shift(
     series: list[tuple[int, float, dict[str, float]]], lifts: list[dict[str, float]] | None = None,
     ref: str = "target",
@@ -345,22 +317,24 @@ class ReplayAnalyzer:
         wonder: WonderBreakdown,
         publish: Callable[[dict], None],
         busy: Callable[[], bool],
-        vla: LazyModel | None,
+        lens: LazyModel | None,
         on_breakdown: Callable[[ReplayResult], Awaitable[None]],
         counterfactual: Callable[..., Awaitable[Counterfactual | None]] | None = None,
         live_attenders: Callable[[], list[tuple[str, str, Callable]]] | None = None,
     ) -> None:
-        """``counterfactual`` is ``ControlLoop.counterfactual``; ``live_attenders`` the running policy's attend."""
+        """``lens`` is the SAM 3 observer; ``counterfactual`` is ``ControlLoop.counterfactual``;
+        ``live_attenders`` the running policy's attend."""
         self.s = settings
         self.sam = sam
         self.wonder = wonder
         self.publish = publish
         self.busy = busy
-        self.vla = vla
+        self.lens = lens
         self.on_breakdown = on_breakdown
         self.counterfactual = counterfactual
         self.live_attenders = live_attenders
         self._cf_tasks: dict[str, asyncio.Task] = {}
+        self._side_lens_text: dict[str, str] = {}  # run_id -> progress text while SAM 3 runs beside the breakdown
         self._nb_cache: dict[int, tuple[list[SegmentedObject], Neighbourhoods | None]] = {}
         self.runs: dict[str, Run] = {}
         self.results: dict[str, ReplayResult] = {}
@@ -401,12 +375,12 @@ class ReplayAnalyzer:
             self.runs[rid] = run
         return run
 
-    def vla_status(self) -> str:
-        if self.vla is None:
+    def lens_status(self) -> str:
+        if self.lens is None:
             return "off"
-        if self.vla.loading:
+        if self.lens.loading:
             return "loading"
-        return "error" if self.vla.model is None else "ready"
+        return "error" if self.lens.model is None else "ready"
 
     # ------------------------------------------------------------------ internals
     @staticmethod
@@ -658,18 +632,13 @@ class ReplayAnalyzer:
             if self.counterfactual is not None:
                 self._cf_tasks[run.run_id] = asyncio.create_task(self._counterfactual(run, r, segs))
 
-            model = None
-            if self.vla is not None:
-                if self.vla.loading:
-                    self._progress(r, "attention", 0.22, f"Waiting for {self.vla.name} to finish loading")
-                model = await self.vla.wait()
-            breakdown_task: asyncio.Task | None = None
+            # SAM 3 (~25 s a frame) is a side view of the failure keyframe: the breakdown starts now and doesn't
+            # wait for it.
+            breakdown_task = asyncio.create_task(self._run_breakdown(run, r, segs))
+            model = await self.lens.wait() if self.lens is not None else None
             if model is not None:
-                breakdown_task = await self._vla_pass(run, r, model, segs)
-            if breakdown_task is None:
-                await self._run_breakdown(run, r, segs)
-            else:
-                await breakdown_task
+                await self._lens_pass(run, r, model, segs)
+            await breakdown_task
             cf_task = self._cf_tasks.get(run.run_id)
             if cf_task is not None:
                 self._progress(r, "refining", max(r.progress, 0.95), "Counterfactual: finishing the attention comparison")
@@ -696,6 +665,77 @@ class ReplayAnalyzer:
         self._event("replay_update", r)
         self._save(run, r)
 
+    # ------------------------------------------------------------------ Wonder's follow-up test
+    def _check_options(self, run: Run, r: ReplayResult, segs) -> dict | None:
+        """What Wonder may ask to test: the objects GlassBox can remove, at the segmented moments up to the
+        failure (an edit needs that frame's own masks), and the test already done."""
+        fail = run.failure_index
+        t_fail = run.frames[fail].t
+        moments = sorted(i for i in segs if i <= fail)
+        removable = sorted({o.label for i in moments for o in segs[i]
+                            if o.label not in NON_DISTRACTOR_LABELS and o.mask.any()})
+        if not removable:
+            return None
+        cf = r.counterfactual
+        done = None
+        if _cf_ready(cf) and cf.culprit_label and cf.frame is not None:
+            done = {"remove": cf.culprit_label, "at_t": round(run.frames[cf.frame].t - t_fail, 2)}
+        return {"remove": removable, "at_t": [round(run.frames[i].t - t_fail, 2) for i in moments],
+                "already_tested": done}
+
+    async def _hypothesis_check(self, run: Run, r: ReplayResult, segs, film, ev: ReplayEvidence, req: CheckRequest) -> None:
+        """Run the counterfactual Wonder asked for, then its second turn: the final breakdown."""
+        t_fail = run.frames[run.failure_index].t
+        frames = [i for i in segs if i <= run.failure_index and any(o.label == req.remove for o in segs[i])]
+        if not frames or r.breakdown is None:
+            return
+        i = min(frames, key=lambda k: abs((run.frames[k].t - t_fail) - req.at_t))
+        objs = segs[i]
+        culprit = next(o for o in objs if o.label == req.remove)
+        req.at_t = round(run.frames[i].t - t_fail, 2)
+        first, first_source = r.breakdown, r.breakdown_source or "local-fallback"
+        chk = HypothesisCheck(
+            hypothesis=req.hypothesis, prediction=req.prediction, remove_label=req.remove, t=req.at_t, frame=i,
+            proposed_by=req.source, first_headline=first.headline, first_confidence=first.confidence,
+            first_culprit=first.culprit_label,
+        )
+        r.hypothesis_check = chk
+        self._progress(r, "breakdown", max(r.progress, 0.6),
+                       f"Muse Wonder is testing its hypothesis: the scene without the {req.remove} at t = {req.at_t:+.1f} s")
+
+        def publish(cf: Counterfactual) -> None:
+            chk.counterfactual = cf
+            self._event("replay_update", r)
+
+        def store(view: str, jpeg: bytes) -> None:
+            if run.path is not None:
+                (run.path / ("check.jpg" if view == "image" else f"check_{view}.jpg")).write_bytes(jpeg)
+
+        t0 = time.perf_counter()
+        try:
+            cf = await self.counterfactual(
+                "OCCLUSION_OOD" if culprit.label == "hand" else "ATTENTION_HIJACK", run.frames[i].policy_bgr(),
+                np.asarray(run.frames[i].qpos, np.float64), objs, culprit, f"/api/replay/{run.run_id}/check.jpg",
+                publish, store, self._cf_attenders, i,
+            )
+        except Exception:  # noqa: BLE001 - the first reading stands
+            log.exception("Wonder's follow-up test failed")
+            cf = None
+        r.latency_ms["check_ms"] = round((time.perf_counter() - t0) * 1000)
+        if not _cf_ready(cf):
+            chk.status, chk.result_summary = "failed", "GlassBox could not run the test; the first reading stands."
+            self._event("replay_update", r)
+            return
+        self._progress(r, "breakdown", max(r.progress, 0.75), "Muse Wonder: revising the breakdown with its test result")
+        facts = {**counterfactual_facts(cf), "at_t_s": req.at_t}
+        t0 = time.perf_counter()
+        r.breakdown, r.breakdown_source, chk.result, chk.result_summary = await self.wonder.conclude(
+            film, ev, first, first_source, req, facts)
+        r.latency_ms["wonder_final_ms"] = round((time.perf_counter() - t0) * 1000)
+        chk.status = "ready"
+        self._event("replay_update", r)
+        self._save(run, r)
+
     # ------------------------------------------------------------------ counterfactual
     def _suspect(self, run: Run, r: ReplayResult, objs: list[SegmentedObject]) -> SegmentedObject | None:
         """The object the counterfactual removes: Spark's culprit, else the distractor with the most attention
@@ -711,24 +751,10 @@ class ReplayAnalyzer:
                 shares[lab] = max(shares.get(lab, 0.0), v)
         return max(cands, key=lambda o: (o.label == named, shares.get(o.label, 0.0), int(o.mask.sum())))
 
-    def _vla_attenders(self, model) -> list[tuple[str, str, Callable]]:
-        """The lens's attention maps from one forward pass per frame (it observes only: no chunk). Grounding
-        maps (SAM 3) are left out: with the suspect painted out, of course SAM 3 no longer finds it."""
-        cache: dict[int, dict[str, np.ndarray]] = {}
-        kinds = [k for k, label in model.lens_maps.items() if label is None]
-
-        def make(kind: str):
-            def attend(state, frame_bgr):
-                key = id(frame_bgr)
-                if key not in cache:
-                    while self.busy():  # don't starve the arm (see _vla_pass)
-                        time.sleep(1.0)
-                    rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-                    cache[key] = model.lens_frame(np.asarray(state, np.float32), rgb)
-                return cache[key].get(kind), model.lens_name.lower().replace(" ", ""), None
-            return attend
-
-        return [(k, MAP_INFO[k][0], make(k)) for k in kinds]
+    async def _cf_attenders(self) -> list[tuple[str, str, Callable]]:
+        """The policy that ran. SAM 3's grounding maps are left out: with the suspect painted out, of course
+        SAM 3 no longer finds it."""
+        return [a for a in (self.live_attenders() if self.live_attenders else []) if a[0] == "act"]
 
     async def _counterfactual(self, run: Run, r: ReplayResult, segs) -> Counterfactual | None:
         fail = run.failure_index
@@ -739,12 +765,6 @@ class ReplayAnalyzer:
             return None
         failure_type, culprit = choice
         frame = run.frames[fail].policy_bgr()
-
-        async def attenders():
-            # The policy that ran first (its verdict leads and it has a predicted reach), then the lens's maps.
-            out = [a for a in (self.live_attenders() if self.live_attenders else []) if a[0] == "act"]
-            model = await self.vla.wait() if self.vla is not None else None
-            return out + (self._vla_attenders(model) if model is not None else [])
 
         def store(view: str, jpeg: bytes) -> None:
             if run.path is not None:
@@ -758,55 +778,43 @@ class ReplayAnalyzer:
         try:
             return await self.counterfactual(
                 failure_type, frame, np.asarray(run.frames[fail].qpos, np.float64), objs, culprit,
-                f"/api/replay/{run.run_id}/counterfactual.jpg", publish, store, attenders, fail,
+                f"/api/replay/{run.run_id}/counterfactual.jpg", publish, store, self._cf_attenders, fail,
             )
         except Exception:  # noqa: BLE001 - the replay goes on without it
             log.exception("Replay counterfactual failed")
             return None
 
-    async def _vla_pass(self, run: Run, r: ReplayResult, model, segs) -> asyncio.Task | None:
-        """The lens (SmolVLA or SAM 3) over keyframes, failure first, then coarse, then fine. Starts the
-        breakdown after coarse."""
-        fail = run.failure_index
-        sam3 = model.lens_name == "SAM 3"
-        hz = self.s.replay_sam3_hz if sam3 else self.s.replay_vla_hz
-        stride = max(1, int(round(run.fps / max(hz, 0.05))))
-        grid_frames = list(range(fail, -1, -stride))[::-1]  # aligned on the failure frame
-        order = [grid_frames[i] for i in reversed(_bisect_order(len(grid_frames)))]
-        order = [fail] + [f for f in order if f != fail]
-        coarse = min(len(order), max(1, self.s.replay_sam3_coarse_keyframes if sam3 else self.s.replay_coarse_keyframes))
-        maps = {kind: self._new_map(kind, len(order)) for kind in model.lens_maps}
+    async def _lens_pass(self, run: Run, r: ReplayResult, model, segs) -> None:
+        """SAM 3 on the failure keyframe, alongside the breakdown (already started, see _analyse)."""
+        frame = run.failure_index
+        maps = {kind: self._new_map(kind, 1) for kind in model.lens_maps}
         r.maps = list(maps.values()) + r.maps
-        what = "where it finds " + " / ".join(f"'{self._phrase(l)}'" for l in model.lens_maps.values() if l) \
-            if sam3 else "attention"
-        breakdown_task: asyncio.Task | None = None
-        for n, frame in enumerate(order):
-            while self.busy():
-                self._progress(r, r.status, r.progress, f"Paused while the arm runs ({model.lens_name} and ACT share the CPU)")
-                await asyncio.sleep(1.0)
-            phase = "attention" if n < coarse else "refining"
-            self._progress(r, phase, 0.22 + 0.68 * n / len(order),
-                           f"{model.lens_name}: {what} in keyframe {n + 1}/{len(order)} "
-                           f"(t = {run.frames[frame].t - run.frames[fail].t:+.1f} s)")
-            f = run.frames[frame]
-            rgb = cv2.cvtColor(f.policy_bgr(), cv2.COLOR_BGR2RGB)
-            t0 = time.perf_counter()
+        what = "where it finds " + " / ".join(f"'{self._phrase(l)}'" for l in model.lens_maps.values() if l)
+        while self.busy():
+            self._progress(r, r.status, r.progress, f"Paused while the arm runs ({model.lens_name} and ACT share the CPU)")
+            await asyncio.sleep(1.0)
+        # Its status shows once the breakdown is written (until then, _run_breakdown shows this).
+        self._side_lens_text[run.run_id] = f"{model.lens_name}: {what} in the failure keyframe"
+        if r.breakdown is not None:
+            self._progress(r, "refining", max(r.progress, 0.9), self._side_lens_text[run.run_id])
+        f = run.frames[frame]
+        rgb = cv2.cvtColor(f.policy_bgr(), cv2.COLOR_BGR2RGB)
+        t0 = time.perf_counter()
+        try:
             out = await asyncio.to_thread(model.lens_frame, np.asarray(f.qpos, np.float32), rgb)
-            r.latency_ms["vla_pass_ms"] = round((time.perf_counter() - t0) * 1000)
-            for kind, sal in out.items():
-                if sal.shape != rgb.shape[:2]:  # the observer works at the live camera size
-                    sal = cv2.resize(sal.astype(np.float32), (rgb.shape[1], rgb.shape[0]), interpolation=cv2.INTER_LINEAR)
-                self._add_keyframe(maps[kind], run, frame, sal, segs)
-            self._recompute_events(run, r)
-            self._event("replay_update", r)
-            if n + 1 == coarse:
-                breakdown_task = asyncio.create_task(self._run_breakdown(run, r, segs))
-        return breakdown_task
+        finally:
+            self._side_lens_text.pop(run.run_id, None)
+        r.latency_ms["lens_ms"] = round((time.perf_counter() - t0) * 1000)
+        for kind, sal in out.items():
+            if sal.shape != rgb.shape[:2]:  # the observer works at the live camera size
+                sal = cv2.resize(sal.astype(np.float32), (rgb.shape[1], rgb.shape[0]), interpolation=cv2.INTER_LINEAR)
+            self._add_keyframe(maps[kind], run, frame, sal, segs)
+        self._recompute_events(run, r)
+        self._event("replay_update", r)
 
     async def _run_breakdown(self, run: Run, r: ReplayResult, segs) -> None:
         kinds = {m.kind: m for m in r.maps if m.keyframes}
-        primary = next((k for k in (self.s.replay_primary_map, "vla_language", "vla_action", "act", "sam3_target")
-                        if k in kinds), None)
+        primary = next((k for k in (self.s.replay_primary_map, "act", "sam3_target") if k in kinds), None)
         refining = r.status == "refining"
         if not refining:
             self._progress(r, "breakdown", max(r.progress, 0.5), "Muse Wonder: writing the forensic breakdown")
@@ -816,9 +824,16 @@ class ReplayAnalyzer:
             await asyncio.wait({cf_task}, timeout=self.s.replay_counterfactual_wait_s)
         film = await asyncio.to_thread(self._filmstrip, run, kinds.get(primary), segs)
         ev = self._evidence(run, r, primary or "act", segs)
+        mode = self.s.wonder_follow_up if self.counterfactual is not None else "off"
+        if mode != "off" and (options := self._check_options(run, r, segs)):
+            ev.extra["follow_up_options"] = options
         t0 = time.perf_counter()
-        r.breakdown, r.breakdown_source = await self.wonder.breakdown(film, ev)
+        r.breakdown, r.breakdown_source, req = await self.wonder.breakdown(film, ev, mode)
         r.latency_ms["wonder_ms"] = round((time.perf_counter() - t0) * 1000)
         self._event("replay_update", r)
+        if req is not None:
+            await self._hypothesis_check(run, r, segs, film, ev, req)
         await self.on_breakdown(r)
         self._event("replay_update", r)
+        if (lens := self._side_lens_text.get(run.run_id)) is not None:  # SAM 3 is still on the failure keyframe
+            self._progress(r, "refining", max(r.progress, 0.9), lens)

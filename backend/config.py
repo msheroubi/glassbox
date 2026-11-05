@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 from pathlib import Path
+from typing import Literal
 
 from pydantic import AliasChoices, BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -18,7 +19,9 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 JOINT_NAMES = ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll", "gripper"]
 
 # Conservative SO-101 joint limits (degrees for body joints, 0-100 for the gripper), matching
-# LeRobot's `use_degrees=True` convention. Used to clamp every recovery waypoint before execution.
+# LeRobot's `use_degrees=True` convention. Every policy action and recovery waypoint is clamped before
+# execution: to these in Wonder's brief, and on the real arm to its own calibrated range
+# (RealSO101.calibrated_limits(); a fixed -100 shoulder_lift floor held the arm short of its rest pose).
 JOINT_LIMITS = {
     "shoulder_pan": (-110.0, 110.0),
     "shoulder_lift": (-100.0, 100.0),
@@ -63,10 +66,6 @@ class Settings(BaseSettings):
     cache_dir: Path = REPO_ROOT / ".cache" / "meta_api"
 
     # --- Hardware -------------------------------------------------------------------------------
-    mock_hardware: bool = False
-    mock_scenario: str = "attention_hijack"
-    # Camera-only (--webcam): stream a USB webcam as the overhead view with no arm; SAM 3.1 / Muse explain the scene.
-    camera_only: bool = False
     robot_port: str = "/dev/ttyACM0"
     robot_id: str = "kowalski_follower"
     serial_baudrate: int = 1_000_000
@@ -80,7 +79,12 @@ class Settings(BaseSettings):
     wrist_width: int = 640
     wrist_height: int = 480
     camera_fps: int = 30
-    max_relative_target_deg: float | None = 10.0
+    # LeRobot's per-step cap on |goal - present position|, per body joint (None: no cap). The STS3215's torque
+    # follows that error, so a tight cap also caps force: at 10 deg the loaded shoulder lagged and the gripper
+    # squeezed the cube weakly, unlike the uncapped teleop the policy was trained on. 30 deg still stops a
+    # wild jump; the gripper is uncapped (max_relative_target_gripper) so it closes with full force.
+    max_relative_target_deg: float | None = 30.0
+    max_relative_target_gripper: float | None = None
 
     # --- Policy ---------------------------------------------------------------------------------
     policy_path: str | None = None  # local dir or HF repo id of a trained LeRobot ACT checkpoint
@@ -90,10 +94,6 @@ class Settings(BaseSettings):
     # Re-run the policy every N steps without changing the executing chunk ("observe" passes): refreshes
     # the attention map and gives the overlapping predictions the chunk-variance OOD signal needs. 0 = off.
     policy_observe_every: int = 20
-    # Camera-only: show a pretrained VLA's attention instead of spectral-residual saliency (no arm commands).
-    vla_path: str | None = None  # e.g. lerobot/smolvla_base
-    vla_camera_key: str = "camera1"  # the VLA's name for the overhead camera
-    vla_attention: str = "action"  # "action": action expert -> image; "language": task tokens -> image
     task_description: str = "Pick up the red cube and place it on the green hex tile."
 
     # --- Calibration ----------------------------------------------------------------------------
@@ -110,7 +110,7 @@ class Settings(BaseSettings):
     chunk_variance_threshold: float = 25.0
     attention_hijack_threshold: float = 0.45  # fixed A(i) rule: only used when there is no attention reference
     # Attention-deviation trigger: attention compared with the demos' attention at the same arm pose
-    # (calibration/attention_reference.npz, built by scripts/build_attention_reference.py).
+    # (calibration/attention_reference.npz: the ACT policy's attention over its own demonstration episodes).
     attention_reference_path: Path = REPO_ROOT / "calibration" / "attention_reference.npz"
     # With a reference, the per-object hijack test is A(i) minus the share the demos had there at this pose.
     attention_hijack_excess_threshold: float = 0.15
@@ -118,9 +118,13 @@ class Settings(BaseSettings):
     attention_deviation_hold_s: float = 1.0  # sustained over two observe passes, so one noisy map can't stop the arm
     stall_progress_s: float = 4.0
     disabled_triggers: list[str] = []  # servo | variance | hijack | stall: detection off, arm keeps running
-    auto_analyze: bool = True
+    # False: an anomaly HOLDs the arm and is shown, but the analysis (and every Meta API call it makes) waits
+    # for the operator's Analyze press.
+    auto_analyze: bool = False
     use_sam_video: bool = False  # True: upload the 90-frame clip; False: segment the anomaly keyframe
-    live_sam_interval_s: float = 4.0  # real robot: background SAM pass feeding the live hijack trigger (0 = off)
+    # Real robot: background SAM pass (one Meta API request per concept) feeding the live attention shares and
+    # the hijack trigger. 0 = off, so Meta is only called by an analysis (plus the staging pre-flight).
+    live_sam_interval_s: float = 0.0
     track_refresh_s: float = 3.0  # re-segment a suppressed object this often so the mask follows it (0 = off)
     concepts: list[SegmentationConcept] = [
         SegmentationConcept(label="gripper", prompt="robotic arm gripper"),
@@ -133,31 +137,30 @@ class Settings(BaseSettings):
 
     # SAM scores the cube as a "red book" (and the book as a "red cube") almost as confidently as the right
     # way round, so on the real camera each red object's colour inside its mask also votes for its label.
-    # Median OpenCV 8-bit LAB of the saturated pixels, measured on this rig's overhead camera
-    # (scripts/measure_appearance.py <run> re-measures them, e.g. under a venue's lighting).
+    # Median OpenCV 8-bit LAB of the saturated pixels, measured on this rig's overhead camera.
     # GLASSBOX_APPEARANCE_REFS='{}' turns the vote off.
     appearance_refs: dict[str, list[float]] = {"target": [156.0, 189.0, 155.0], "distractor": [169.0, 182.0, 134.0]}
 
-    # --- Offline replay (the failure, re-analysed with heavier attention models) -----------------
+    # --- Offline replay (the failure, re-analysed with a heavier perception model) ---------------
     replay_enabled: bool = True
     runs_dir: Path = REPO_ROOT / "runs"
     replay_window_s: float = 15.0  # seconds of the run before the failure that are replayed
     replay_tail_s: float = 2.0  # and after it: the arm stopping (recorded while SAM and Spark run)
     replay_fps: float = 15.0  # frames kept per second of run (playback is interpolated in the browser)
     replay_sam_keyframes: int = 4  # SAM 3.1 segmentations across the replay (masks for the A(label) curves)
-    replay_vla_path: str | None = None  # e.g. lerobot/smolvla_base: observe-only attention lens for replays
-    replay_vla_hz: float = 1.0  # SmolVLA keyframes per second of run (~6 s each on CPU)
-    replay_coarse_keyframes: int = 5  # Muse Wonder starts once this many SmolVLA keyframes are done
-    # SAM 3 (facebook/sam3, run locally) as the replay lens instead of SmolVLA: where a perception model finds
-    # the target and goal phrases in each keyframe. Not the policy's attention; it shows visual ambiguity.
-    replay_sam3: bool = False
+    # SAM 3 (facebook/sam3, run locally) as the replay lens: where a perception model finds the target and goal
+    # phrases in the failure keyframe (one frame, ~25 s on CPU, run alongside the breakdown, which doesn't wait
+    # for it). Not the policy's attention; it shows visual ambiguity.
+    replay_sam3: bool = True
     sam3_model: str = "facebook/sam3"
     sam3_python: Path = REPO_ROOT / ".venv-sam3" / "bin" / "python"  # transformers >= 5 lives only there
     sam3_lens_labels: list[str] = ["target", "goal"]  # concepts whose prompts SAM 3 grounds
-    replay_sam3_hz: float = 0.5  # SAM 3 keyframes per second of run (~20-25 s each on CPU)
-    replay_sam3_coarse_keyframes: int = 3  # Muse Wonder starts once this many SAM 3 keyframes are done
-    replay_primary_map: str = "vla_language"  # the map shown in Wonder's filmstrip (falls back if missing)
+    replay_primary_map: str = "act"  # the map shown in Wonder's filmstrip (falls back if missing)
     replay_counterfactual_wait_s: float = 30.0  # Wonder waits this long for the counterfactual test
+    # Wonder's follow-up turn: its first reading proposes a hypothesis and one more counterfactual of its choosing
+    # (remove an object at a recorded moment), GlassBox runs it, and a second Wonder turn writes the final
+    # breakdown with the result. always: it always proposes one | auto: only when it is unsure | off.
+    wonder_follow_up: Literal["always", "auto", "off"] = "always"
     # Self-correction: apply Wonder's intervention automatically when it says no human is needed.
     self_correct: bool = False
 
@@ -169,7 +172,7 @@ class Settings(BaseSettings):
     # run is diagnosed, replayed and self-corrected like a detected one. Labelled "DEMO" in the anomaly reasons.
     demo_manual_failure: bool = False
     # Wait in HOLD for the operator's Start (the Resume button) after launch and after each Reset, instead of
-    # running the policy as soon as it is loaded. Lets the cameras, SAM pre-flight and SmolVLA load first.
+    # running the policy as soon as it is loaded. Lets the cameras, SAM pre-flight and SAM 3 load first.
     start_paused: bool = False
     preflight_timeout_s: float = 20.0
 

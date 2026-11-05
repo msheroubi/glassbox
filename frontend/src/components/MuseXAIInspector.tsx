@@ -24,7 +24,7 @@ interface Props {
   voicePartial: string;
   onAnalyze: () => void;
   onApplyFix: (override?: InterventionType) => void;
-  onReset: (scenario?: string) => void;
+  onReset: () => void;
   onEstop: () => void;
   onResume: () => void;
   onHold: () => void;
@@ -75,14 +75,10 @@ function fmtTime(t: number): string {
 
 export default function MuseXAIInspector(props: Props) {
   const { status, analysis, analyzing, applying } = props;
-  const [scenario, setScenario] = useState<string>("");
   const [override, setOverride] = useState<"" | InterventionType>("");
   const [question, setQuestion] = useState("");
   const chatEnd = useRef<HTMLDivElement | null>(null);
 
-  useEffect(() => {
-    if (status?.scenario && !scenario) setScenario(status.scenario);
-  }, [status?.scenario, scenario]);
   useEffect(() => setOverride(""), [analysis?.analysis_id]);
   useEffect(() => chatEnd.current?.scrollIntoView({ block: "nearest" }), [props.chat.length]);
 
@@ -90,7 +86,6 @@ export default function MuseXAIInspector(props: Props) {
   const thr = status?.thresholds.attention_hijack ?? 0.45;
   const fix: InterventionType | undefined = override || diag?.intervention_type;
   const state = status?.state ?? "OFFLINE";
-  const scenarios = status?.scenarios ?? {};
 
   const submitQuestion = () => {
     const q = question.trim();
@@ -108,17 +103,15 @@ export default function MuseXAIInspector(props: Props) {
           <span className="status-text" title={status?.status}>{status?.status ?? (props.connected ? "" : "backend offline")}</span>
         </div>
         <div className="row chips">
-          <span className="chip">
-            {status?.camera_only ? "webcam only (no arm)" : status?.mock_hardware ? "mock hardware" : "SO-101 hardware"}
-          </span>
+          <span className="chip">SO-101 hardware</span>
           <span className="chip">policy: {status?.policy ?? "-"}</span>
           <span className="chip">phase: {status?.phase ?? "-"}</span>
           <span className={`chip ${status?.meta_api_enabled ? "ok" : "warn"}`}>
             Meta API {status?.meta_api_enabled ? "connected" : "off (local fallbacks)"}
           </span>
           {status?.replay.enabled && (
-            <span className={`chip ${status.replay.vla === "ready" ? "ok" : status.replay.vla === "error" ? "warn" : ""}`} title={status.replay.vla_path ?? "no replay lens (ACT attention only)"}>
-              {status.replay.lens ?? "Replay lens"}: {status.replay.vla === "loading" ? "loading…" : status.replay.vla}
+            <span className={`chip ${status.replay.lens === "ready" ? "ok" : status.replay.lens === "error" ? "warn" : ""}`} title={status.replay.lens_model ?? "no replay lens (ACT attention only)"}>
+              SAM 3: {status.replay.lens === "loading" ? "loading…" : status.replay.lens}
             </span>
           )}
           {status?.demo_staging_enabled && (
@@ -134,27 +127,11 @@ export default function MuseXAIInspector(props: Props) {
           )}
         </div>
         <div className="row controls">
-          {status?.mock_hardware && (
-            <>
-              <select value={scenario} onChange={(e) => setScenario(e.target.value)} title={scenarios[scenario]}>
-                {Object.keys(scenarios).map((s) => (
-                  <option key={s} value={s}>
-                    {s}
-                  </option>
-                ))}
-              </select>
-              <button className="btn" onClick={() => props.onReset(scenario || undefined)}>
-                ↺ Reset scenario
-              </button>
-            </>
-          )}
-          {!status?.mock_hardware && (
-            <button className="btn" onClick={() => props.onReset()}>
-              ↺ Reset
-            </button>
-          )}
+          <button className="btn" onClick={() => props.onReset()}>
+            ↺ Reset
+          </button>
           <span className="spacer" />
-          {status && !status.camera_only && (
+          {status && (
             <label className="switch" title="When Muse Wonder finds a fix that needs no human, apply it and resume automatically">
               <input type="checkbox" checked={status.self_correct} onChange={(e) => props.onSelfCorrect(e.target.checked)} />
               <span className="switch-track" />
@@ -178,11 +155,10 @@ export default function MuseXAIInspector(props: Props) {
         {status?.awaiting_start && (
           <p className="muted small">
             Waiting for you to start the policy. Pre-flight scan: {status.preflight ? "running…" : "done"}
-            {status.replay.enabled && <> · {status.replay.lens ?? "replay lens"}: {status.replay.vla === "loading" ? "loading…" : status.replay.vla}</>}
+            {status.replay.enabled && <> · SAM 3: {status.replay.lens === "loading" ? "loading…" : status.replay.lens}</>}
             {" "}· Meta API: {status.meta_api_enabled ? "connected" : "off"}
           </p>
         )}
-        {status?.mock_hardware && scenarios[scenario] && <p className="muted small">{scenarios[scenario]}</p>}
         {!!status?.suppression.length && (
           <div className="row suppress-row">
             <span>
@@ -210,14 +186,7 @@ export default function MuseXAIInspector(props: Props) {
           {analyzing ? <span className="spinner" /> : "🔍"} {analyzing ? "Analysing with SAM 3.1 + Muse Spark…" : "Trigger Failure Analysis"}
         </button>
 
-        {!analysis && !analyzing && status?.camera_only && (
-          <p className="muted small">
-            Camera-only mode: no arm is connected, so the joint/servo triggers are off. The heatmap is bottom-up visual
-            saliency (no policy). Trigger analysis to have SAM 3.1 segment the named objects and Muse Spark explain the scene,
-            or ask a question below.
-          </p>
-        )}
-        {!analysis && !analyzing && !status?.camera_only && (
+        {!analysis && !analyzing && (
           <p className="muted small">
             Anomalies (joint error &gt; {status?.thresholds.joint_error_deg ?? "-"}°, chunk variance &gt;{" "}
             {status?.thresholds.chunk_variance ?? "-"}, or A(distractor) &gt; {thr}) pause the policy and trigger analysis

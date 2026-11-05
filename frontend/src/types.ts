@@ -1,6 +1,6 @@
 // Mirrors backend/schemas.py and the JSON emitted by backend/control_loop.py.
 
-export type RunState = "RUNNING" | "HOLD" | "ESTOP" | "COMPLETE";
+export type RunState = "RUNNING" | "HOLD" | "ESTOP";
 export type FailureType = "ATTENTION_HIJACK" | "SERVO_STALL_COLLISION" | "OCCLUSION_OOD" | "SPECULAR_GLARE" | "NONE";
 export type InterventionType = "INPAINT_MASK_SUPPRESSION" | "WAYPOINT_BYPASS" | "RETRY_GRASP_OFFSET" | "NONE";
 export type ResultSource = "meta-api" | "cache" | "local-fallback";
@@ -143,10 +143,6 @@ export interface RuntimeStatus {
   state: RunState;
   status: string;
   phase: string;
-  mock_hardware: boolean;
-  camera_only: boolean;
-  scenario: string | null;
-  scenarios: Record<string, string>;
   policy: string;
   saliency_method: string;
   meta_api_enabled: boolean;
@@ -164,7 +160,7 @@ export interface RuntimeStatus {
   preflight: boolean;
   awaiting_start: boolean;
   self_correct: boolean;
-  replay: { enabled: boolean; latest_id: string | null; vla: "off" | "loading" | "error" | "ready"; vla_path: string | null; lens?: string | null };
+  replay: { enabled: boolean; latest_id: string | null; lens: "off" | "loading" | "error" | "ready"; lens_model: string | null };
 }
 
 /** Demo staging: the distractor is cut from where it is and pasted onto the goal in the policy's input. */
@@ -189,7 +185,6 @@ export interface FrameMeta {
   state: RunState;
   phase: string;
   status: string;
-  scenario: string | null;
   fps: number;
   telemetry: ServoTelemetry;
   saliency: SaliencyGrid | null;
@@ -226,7 +221,7 @@ export interface AskResponse {
 export type FailureStage = "PERCEPTION" | "DECISION" | "ACTUATION" | "NONE";
 export type ReplayStatus = "saving" | "segmenting" | "attention" | "breakdown" | "refining" | "done" | "failed";
 export type SelfCorrection = "off" | "pending" | "applied" | "declined" | "unavailable";
-export type MapKind = "vla_language" | "vla_action" | "act" | "sam3_target" | "sam3_goal" | string;
+export type MapKind = "act" | "sam3_target" | "sam3_goal" | string;
 
 export interface ReplayFrameInfo {
   t: number; // seconds relative to the failure frame
@@ -293,6 +288,23 @@ export interface FailureBreakdown {
   operator_explanation: string;
 }
 
+/** Muse Wonder's follow-up: the hypothesis its first reading proposed, the test it chose, and the result. */
+export interface HypothesisCheck {
+  status: "running" | "ready" | "failed";
+  hypothesis: string;
+  prediction: string;
+  remove_label: string;
+  t: number;
+  frame: number;
+  proposed_by: ResultSource;
+  first_headline: string;
+  first_confidence: number;
+  first_culprit: string | null;
+  counterfactual: Counterfactual | null;
+  result: "supported" | "refuted" | "inconclusive" | null;
+  result_summary: string;
+}
+
 export interface ReplayResult {
   replay_id: string;
   analysis_id: string | null;
@@ -316,6 +328,7 @@ export interface ReplayResult {
   self_correction: SelfCorrection;
   self_correction_note: string;
   counterfactual: Counterfactual | null;
+  hypothesis_check?: HypothesisCheck | null;
   latency_ms: Record<string, number>;
 }
 

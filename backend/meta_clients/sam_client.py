@@ -15,7 +15,6 @@ import base64
 import hashlib
 import json
 import logging
-from collections.abc import Callable
 
 import cv2
 import numpy as np
@@ -37,8 +36,6 @@ log = logging.getLogger(__name__)
 
 MIN_CONFIDENCE = 0.3
 
-GroundTruthFn = Callable[[], list]  # returns objects with .label, .prompt, .mask
-
 
 def _place_mask(rec: SegmentationMaskRecord, frame_hw: tuple[int, int]) -> np.ndarray:
     raster = np.frombuffer(decode_mask_to_raster(rec.mask), np.uint8).reshape(rec.mask.height, rec.mask.width)
@@ -54,12 +51,10 @@ def _place_mask(rec: SegmentationMaskRecord, frame_hw: tuple[int, int]) -> np.nd
 
 class SAMClient:
     def __init__(
-        self, settings: Settings, client: MetaClient, ground_truth: GroundTruthFn | None = None,
-        appearance_refs: dict[str, list[float]] | None = None,
+        self, settings: Settings, client: MetaClient, appearance_refs: dict[str, list[float]] | None = None,
     ) -> None:
         self.s = settings
         self.client = client
-        self.ground_truth = ground_truth
         self.appearance_refs = appearance_refs  # colour vote for the cube vs the book (real camera only)
 
     async def _events(self, body: dict, cache_key: str):
@@ -154,19 +149,13 @@ class SAMClient:
             except (MetaAPIError, Exception) as e:  # noqa: BLE001 - demo must never crash on SAM
                 log.warning("SAM 3.1 unavailable (%s); using fallback segmentation", e)
                 objects = []
-        # Fill concepts SAM did not find (e.g. a stylised simulator arm) from simulator ground truth.
-        if self.ground_truth is not None:
-            found = {o.label for o in objects}
-            for gt in self.ground_truth():
-                if gt.label not in found and gt.mask.shape == frame_hw and gt.mask.any():  # not for another camera's frames
-                    objects.append(SegmentedObject(len(objects), gt.label, gt.prompt, gt.mask, None, "sim-ground-truth"))
         return objects, source
 
     async def refresh_track(self, frame_bgr: np.ndarray, previous: SegmentedObject) -> np.ndarray | None:
         """Re-segment one concept and return the mask that best overlaps the previous one."""
         concept = SegmentationConcept(label=previous.label, prompt=previous.prompt)
         objs, source = await self.segment(frame_bgr, concepts=[concept])
-        candidates = [o for o in objs if o.label == previous.label and (source == "meta-api" or o.source != "sam-3.1")]
+        candidates = [o for o in objs if o.label == previous.label] if source == "meta-api" else []
         if not candidates:
             return None
         best = max(candidates, key=lambda o: np.logical_and(o.mask, previous.mask).sum() / (o.mask.sum() + 1))

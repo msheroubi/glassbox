@@ -122,13 +122,10 @@ export default function App() {
     [fail, setStatus],
   );
 
-  const onReset = useCallback(
-    (scenario?: string) => {
-      setScrub(null);
-      void statusAction("Reset failed", () => api.reset(scenario))();
-    },
-    [statusAction],
-  );
+  const onReset = useCallback(() => {
+    setScrub(null);
+    void statusAction("Reset failed", () => api.reset())();
+  }, [statusAction]);
 
   const onAsk = useCallback(
     async (q: string) => {
@@ -165,7 +162,7 @@ export default function App() {
     }
   }, [tel.replayStarted]);
 
-  // Default to the most informative map that has data (SmolVLA when it is the lens, else ACT, else SAM 3).
+  // Default to the most informative map that has data (ACT, else SAM 3).
   useEffect(() => {
     if (!replay) return;
     const have = (k: string | null) => replay.maps.some((m) => m.kind === k && m.keyframes.length > 0);

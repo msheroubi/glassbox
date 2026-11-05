@@ -3,6 +3,7 @@ import type { Counterfactual, CounterfactualMap } from "../types";
 
 interface Props {
   cf: Counterfactual;
+  title?: string;
   onRerender?: () => void;
   onShowFrame?: () => void;
 }
@@ -123,7 +124,7 @@ function Wipe({ before, after, polygons }: { before: string; after: string; poly
 }
 
 /** Muse Image removes the culprit inside its SAM region; the policies are asked where they'd look without it. */
-export default function CounterfactualCard({ cf, onRerender, onShowFrame }: Props) {
+export default function CounterfactualCard({ cf, title = "Counterfactual test", onRerender, onShowFrame }: Props) {
   const [mode, setMode] = useState<"scene" | "attention">("scene");
   const verdict = outcome(cf);
   const hasAttention = cf.maps.length > 0 && cf.image_url !== null;
@@ -133,7 +134,7 @@ export default function CounterfactualCard({ cf, onRerender, onShowFrame }: Prop
   return (
     <div className="cf-card">
       <div className="cf-head">
-        <b>Counterfactual test</b>
+        <b>{title}</b>
         <span className="muted">without {cf.removed}</span>
         <span className="spacer" />
         {cf.source && (

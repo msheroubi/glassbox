@@ -384,7 +384,7 @@ export default function ReplayPlayer({
             <b>No failure recorded yet</b>
             <span>
               When the policy fails, the seconds leading up to it are saved and replayed here, frame by frame, with ACT's
-              attention, SAM 3.1 masks, an observe-only lens (SAM 3 or SmolVLA) and a Muse Wonder breakdown.
+              attention, SAM 3.1 masks, SAM 3's perception maps and a Muse Wonder breakdown.
             </span>
           </div>
         )}

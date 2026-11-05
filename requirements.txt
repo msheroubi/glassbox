@@ -1,4 +1,4 @@
-# Server + XAI engine (mock and camera-only modes need nothing else)
+# Server + XAI engine
 fastapi>=0.110
 uvicorn[standard]>=0.29
 pydantic>=2.6
@@ -9,5 +9,6 @@ numpy>=1.26
 opencv-python>=4.9
 meta-sam-parser>=0.1.0  # SAM 3.1 response grammar + mask decoding (Meta)
 
-# Real SO-101 + ACT policy only: install LeRobot with the Feetech extra, e.g.
-#   pip install "lerobot[feetech]"   (brings torch)
+# The SO-101 arm and the ACT policy: LeRobot with the Feetech extra (brings torch)
+#   pip install "lerobot[feetech]"
+# The SAM 3 replay lens runs in its own venv (.venv-sam3, transformers >= 5): see the README.
